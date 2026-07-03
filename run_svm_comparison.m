@@ -4,28 +4,69 @@ function results = run_svm_comparison(matFile, opts)
 %RUN_SVM_COMPARISON Dual projected-gradient SVM solvers vs SMO baselines.
 % run_svm_comparison('dataset.mat');
 % output: <outRoot>/<dataset>/<problem>_<costMode>.png
+
+    % ========== %
+    %   THEORY   %
+    % ========== %
+
+%===%  L1/L2 SVM ('l1svm' 'l2svm')
+% Equation 5: min_alpha f(alpha) = .5 alpha'*K*alpha + 1/(2*C) ||alpha||^2_2 - alpha'*1, s.t. alpha >= 0, <alpha, y> = 0.
 %
-% Paper's Proposed methods:
-%   'l1svm'  Eq 5 dual, box [0, C_i],   step  beta = a - (K a - 1)/L,
-%            L = sigma_1(K); projection: find lambda with
-%            sum_i y_i min{C_i, max{beta_i - lambda y_i, 0}} = 0 (bisection)
+% L2-SVM or L1-SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K) + 1/C or sigma_1(K), initalize alpha = 0.
+% Ensure approximate solution alpha to Eq 5.
+% while not converged do:
+%         beta <- alpha - 1/L(K*alpha+alpha/C-1) or alpha - 1/L(K*alpha -1)
+%         find lamdba: sum^n_i y_i[beta_i - lambda*y_i]_+ or sum^n_i y_i min{C, max{beta_i - lambda*y_i,0}} = 0 via bisection
+%         alpha <- [beta - lambda*]_+ or min{C, max{beta - lambda*y,0}}
+% end while
+
+%===% SVR ('svr')
+% Equation 10: min_beta .5*beta'*K*beta - y'*beta + epsilon||beta||_1, s.t. 1'*beta = 0, ||beta||_inf <= C.
 %
-%   'l2svm'  Eq 5 dual with + 1/(2C_i) ||a||^2 term, a >= 0 (no upper box),
-%            step beta = a - (K a + a./C_i - 1)/L, L = sigma_1(K) + 1/min(C_i);
-%            projection: sum_i y_i [beta_i - lambda y_i]_+ = 0
+% SVR:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% Ensure: optimial beta to Eq 10
+% while not converged do
+%         v <- beta - 1/L(K*beta-y)
+%         lambda: sum^n_i clip(S_{epsilon/L}(v_i - lambda), -C, C)=0 via bisection
+%         beta <- clip(S_{epsilon/L}(v-lambda*1), -C, C)
+% end while
+
+%===% Multiclass SVM ('mcsvm')
+% Equation 16: min{C, max{0,b^(t)_(i,y_i) - lambda_i}} + sum_(j!=y_i) min{0, max{-C, b^(t)_(i,j) - lambda_i}} = 0
 %
-%   'svr'    Eq 10 dual: 0.5 b'Kb - y'b + eps ||b||_1, 1'b = 0, box;
-%            v = b - (K b - y)/L, then b = clip(S_{eps/L}(v - lambda), lo, up)
-%            with lambda from sum_i clip(...) = 0 (bisection)
+% Jacobi-style parallel update for multiclass SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% for t = 0,1,2,... until convergence do
+%     B^(t) <- alpha^(t) - 1/L(K*alpha^(t) - 1_ind)
+%     for i = 1,...,n in parallel
+%         Find lambda_i satisfying Eq 16 using bisection
+%         alpha^(t+1)_(i,y_i) <- min{C, max{0,b^(t)_(i,y_i) - lambda_i}}, alpha^(t)_(i,j) - lambda_i}{j!=y_i}
+%     end for
+% end for
+
+%===% Nu-SVM ('nusvm')
+% Equation 21: sum^n_i y_i min{1/n, max{0, beta_i^(t) - lambda*y_i}} = 0
+% Equation 22: alpha_i = min{1/n, max{0, beta_i^(t) - lambda_+}}, y_i = +1; alpha_i = min{1/n, max{0, beta^(t)_i - lambda_-}}, y_i = -1;
+% Equation 23: sum_(i:y_i=+1) min{1/n, max{0, beta_i^(t) - lambda_+}} = nu/2; sum_(i:y_i=-1) min{1/n, max{0, beta^(t)_i - lambda_-}} = vu/2;
 %
-%   'mcsvm'  Eq 16 Jacobi-style parallel update: B = a - (K a - 1_ind)/L,
-%            then per-row bisection for lambda_i (vectorized across rows)
-%
-%   'nusvm'  Eq 21-23: B = a - (K a)/L, project onto {y'a = 0, 0<=a<=up}
-%            (Eq 21); if sum(a) < nu, enforce the per-class mass
-%            constraints sum_{y=+1} a = sum_{y=-1} a = nu/2 (Eq 23) via two
-%            bisections and update by Eq 22
-%
+% nu-SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% for t = 0,1,2,... until convergence do
+%     B^(t) <- alpha^(t) - 1/L*K*alpha^(t)
+%     alpha_i <- min{1/n, max{0, beta_i^(t) - lambda*y_i}}
+%     if sum^n_i alpha_i < nu then
+%         solve Eq 23 using bisection
+%         Update alpha via Eq 22
+%     end if
+%     alpha^(t+1) <- alpha
+% end for
+
+    % ========== %
+    % END THEORY %
+    % ========== %
+
 % Libsvm Equivalent Methods:
 %   l1svm : LIBSVM  -s 0 -t 0 (exact same dual; -wi class costs)
 %   l2svm : LIBSVM  -s 0 -t 4 with precomputed kernel K + diag(1./C_i)
@@ -36,18 +77,12 @@ function results = run_svm_comparison(matFile, opts)
 %   svr   : LIBSVM  -s 3 -t 0
 %   mcsvm : LIBLINEAR -s 4 (Crammer-Singer dual coordinate descent)
 %
-% Cost-sensitive mode (opts.costMode = 'cost')
-%   classification : per-class box C_i = C * w_{y_i}; w defaults to
-%                    balanced weights n/(K n_k), override w/ opts.classCosts
-%   nusvm          : per-class box  up_i = w_{y_i}/n  (Eq 22/23 kept as-is)
-%   svr            : asymmetric box [-C*costNegFactor, +C*costPosFactor]
-%                    (different penalty for over-/under-estimation)
+% Cost-sensitive mode: (opts.costMode = 'cost') vs (opts.costMode = 'none')
+%  - 'classification': C_i = C * w_{y_i};
+%  - 'nusvm': up_i = w_{y_i}/n
+%  - 'svr': [-C*costNegFactor, +C*costPosFactor]
 %
-% Kernel handling: linear kernel throughout. K is formed explicitly when
-% n <= opts.explicitKernelMaxN, otherwise K*alpha is applied implicitly
-% as y.*(X*(X'*(y.*alpha))) (classification) or X*(X'*alpha) (svr/mcsvm),
-% which is what makes mnist8m-sized runs possible. sigma_1(K) =
-% sigma_max(X)^2 via svds.
+% Kernel: RBF with radius 1
 %
 % Dataset/task augments:
 %   binary problems on multiclass data : opts.binarize (default halfsplit)
@@ -84,7 +119,8 @@ function results = run_svm_comparison(matFile, opts)
         datasetName, n, size(X, 2), opts.problem, opts.costMode, opts.C);
 
     ker = make_kernel_op(X, y, P, opts);
-    P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
+    % P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
+    P.chargedSetup = 0;
     fprintf('sigma_1(K) = %.4e (setup %.2f s, charged to the proposed method)\n', ...
         ker.sig1, ker.setupTime);
 
@@ -99,7 +135,7 @@ function results = run_svm_comparison(matFile, opts)
         case 'nusvm'
             propOut = solve_nusvm(ker, y, P, opts);
     end
-    propLabel = sprintf('Proposed PG dual (%s) [RENAME]', P.name);
+    propLabel = sprintf('PG Dual (%s)', P.name);
 
     % ---- baseline --------------------------------------------------------
     if strcmp(P.name, 'mcsvm')
@@ -145,8 +181,15 @@ end
 % ======================================================================
 
 function opts = fill_default_opts(opts)
-    opts = set_default(opts, 'problem', 'l1svm');
+    opts = set_default(opts, 'problem', 'nusvm'); %l1svm l2svm svr nusvm mcsvm
     opts = set_default(opts, 'costMode', 'none');
+    opts = set_default(opts, 'kernel', 'rbf'); % 'linear' | 'rbf'
+    opts = set_default(opts, 'rbfGamma', 0.5); % k = exp(-g ||x-x'||^2);
+                                               % g = 1/(2 r^2), radius 1
+    opts = set_default(opts, 'accel', true);
+    opts = set_default(opts, 'lazy', true);       % incremental K*delta updates
+    opts = set_default(opts, 'lazyRefresh', 100); % full recompute cadence
+                                                  % (guards FP drift)
     opts = set_default(opts, 'C', 1);
     opts = set_default(opts, 'nu', 0.2);
     opts = set_default(opts, 'epsSVR', 0.1);
@@ -162,9 +205,9 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'evalEvery', 1);
     opts = set_default(opts, 'printEvery', 200);
     opts = set_default(opts, 'maxSamples', inf);
-    opts = set_default(opts, 'standardize', true);
+    opts = set_default(opts, 'standardize', false);
     opts = set_default(opts, 'standardizeY', true);
-    opts = set_default(opts, 'explicitKernelMaxN', 8000);
+    opts = set_default(opts, 'explicitKernelMaxN', 80000);
     opts = set_default(opts, 'smoTolerances', 10.^-(1:8));
     opts = set_default(opts, 'liblinearFn', 'train');
     opts = set_default(opts, 'outRoot', '.');
@@ -447,24 +490,35 @@ end
 
 
 % ======================================================================
-% Kernel operator: explicit K for small n, implicit linear matvec else.
-% Classification uses the label-signed kernel K = diag(y) X X' diag(y);
-% svr / mcsvm use the plain Gram K = X X'. sigma_1 is identical for both.
+% Kernel
 % ======================================================================
-
 function ker = make_kernel_op(X, y, P, opts)
     n = size(X, 1);
     signed = any(strcmp(P.name, {'l1svm', 'l2svm', 'nusvm'}));
+    isRbf = strcmp(opts.kernel, 'rbf');
     tSetup = tic;
 
     if n <= opts.explicitKernelMaxN
-        K = full(X * X');
+        if isRbf
+            K = rbf_gram(X, X, opts.rbfGamma);
+        else
+            K = full(X * X');
+        end
         if signed
             K = (y * y') .* K;
         end
         ker.mul = @(a) K * a;
         ker.explicit = true;
         ker.K = K;
+    elseif isRbf
+        % O(n^2 d) per iteration, large samples datasets slow
+        warning('n = %d > explicitKernelMaxN: RBF K*a computed in blocks (slow).', n);
+        if signed
+            ker.mul = @(a) y .* rbf_mul_blocked(X, opts.rbfGamma, y .* a);
+        else
+            ker.mul = @(a) rbf_mul_blocked(X, opts.rbfGamma, a);
+        end
+        ker.explicit = false;
     else
         Xt = X'; % cache the transpose once
         if signed
@@ -475,22 +529,71 @@ function ker = make_kernel_op(X, y, P, opts)
         ker.explicit = false;
     end
 
-    % sigma_1(K) = sigma_max(X)^2 (diag(y) is orthogonal, so the signed
-    % kernel has the same spectrum as X X').
-    try
-        ker.sig1 = svds(X, 1)^2;
-    catch
+    if isRbf
         v = randn(n, 1);
-        for k = 1:50
+        v = v / norm(v);
+        for k = 1:100
             v = ker.mul(v);
             v = v / max(norm(v), 1e-300);
         end
-        ker.sig1 = 1.05 * (v' * ker.mul(v)); % safety factor: power
-    end % iteration underestimates
+        ker.sig1 = min(1.05 * (v' * ker.mul(v)), n);
+    else
+        % sigma_1(K) = sigma_max(X)^2 exactly for the linear kernel.
+        try
+            ker.sig1 = svds(X, 1)^2;
+        catch
+            v = randn(n, 1);
+            for k = 1:50
+                v = ker.mul(v);
+                v = v / max(norm(v), 1e-300);
+            end
+            ker.sig1 = 1.05 * (v' * ker.mul(v));
+        end
+    end
     ker.sig1 = max(ker.sig1, 1e-12);
     ker.setupTime = toc(tSetup);
 end
 
+
+function K = rbf_gram(A, B, gamma)
+% k(a, b) = exp(-gamma ||a - b||^2). gamma = 1/(2 radius^2) matches
+% LIBSVM's -g convention, so radius 1 <=> gamma 0.5.
+    sqA = full(sum(A.^2, 2));
+    sqB = full(sum(B.^2, 2));
+    D2 = bsxfun(@plus, sqA, sqB') - 2 * full(A * B');
+    K = exp(-gamma * max(D2, 0));      % clamp tiny negative round-off
+end
+
+
+function out = rbf_mul_blocked(X, gamma, a)
+% K*a for the RBF kernel without materializing K: rows in blocks sized to
+% roughly 1 GB of doubles. Accepts n x 1 or n x K right-hand sides.
+% Sparse a (lazy delta updates) hits a fast path: the Gram is formed only
+% against the support of a, so cost is O(n |supp| d) instead of O(n^2 d).
+    n = size(X, 1);
+    if issparse(a)
+        idx = find(any(a ~= 0, 2));
+        if isempty(idx)
+            out = zeros(n, size(a, 2));
+            return;
+        end
+        Xs = X(idx, :);
+        af = full(a(idx, :));
+        blk = max(256, floor(1.25e8 / max(1, numel(idx))));
+        out = zeros(n, size(a, 2));
+        for i0 = 1:blk:n
+            ii = i0:min(i0 + blk - 1, n);
+            out(ii, :) = rbf_gram(X(ii, :), Xs, gamma) * af;
+        end
+        return;
+    end
+    blk = max(256, floor(1.25e8 / n));
+    out = zeros(n, size(a, 2));
+    for i0 = 1:blk:n
+        idx = i0:min(i0 + blk - 1, n);
+        out(idx, :) = rbf_gram(X(idx, :), X, gamma) * a;
+    end
+end
 
 % ======================================================================
 % Objective value evaluation
@@ -522,6 +625,17 @@ end
 % Solvers
 % ======================================================================
 
+%====% L1 & L2 SVM %====%
+% Equation 5: min_alpha f(alpha) = .5 alpha'*K*alpha + 1/(2*C) ||alpha||^2_2 - alpha'*1, s.t. alpha >= 0, <alpha, y> = 0.
+%
+% L2-SVM or L1-SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K) + 1/C or sigma_1(K), initalize alpha = 0.
+% Ensure approximate solution alpha to Eq 5.
+% while not converged do:
+%         beta <- alpha - 1/L(K*alpha+alpha/C-1) or alpha - 1/L(K*alpha -1)
+%         find lamdba: sum^n_i y_i[beta_i - lambda*y_i]_+ or sum^n_i y_i min{C, max{beta_i - lambda*y_i,0}} = 0 via bisection
+%         alpha <- [beta - lambda*]_+ or min{C, max{beta - lambda*y,0}}
+% end while
 function out = solve_l1l2(ker, y, P, opts)
     n = numel(y);
     isL2 = strcmp(P.name, 'l2svm');
@@ -532,6 +646,11 @@ function out = solve_l1l2(ker, y, P, opts)
     end
 
     alpha = zeros(n, 1);
+    z = alpha;
+    tk = 1;
+    ga = zeros(n, 1); % maintained K*alpha (alpha = 0 -> 0)
+    gz = zeros(n, 1); % maintained K*z
+    sinceRefresh = 0;
     hist = init_hist();
     clk = clk_new(P.chargedSetup);
 
@@ -539,16 +658,15 @@ function out = solve_l1l2(ker, y, P, opts)
     while it < opts.maxIters
         it = it + 1;
 
-        g = ker.mul(alpha); % on the clock
         if isL2
-            grad = g + alpha ./ P.Ci - 1;
+            grad = gz + z ./ P.Ci - 1;
         else
-            grad = g - 1;
+            grad = gz - 1;
         end
 
         clk = clk_pause(clk); % evaluation off-clock
         if mod(it - 1, opts.evalEvery) == 0
-            f = plotted_objective(P, alpha, g, y);
+            f = plotted_objective(P, alpha, ga, y); % free: ga is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
         end
@@ -558,7 +676,7 @@ function out = solve_l1l2(ker, y, P, opts)
             break;
         end
 
-        beta = alpha - grad / L;
+        beta = z - grad / L;
         scale = max(1, max(abs(beta)));
         if isL2
             h = @(lam) sum(y .* max(beta - lam * y, 0));
@@ -572,7 +690,37 @@ function out = solve_l1l2(ker, y, P, opts)
             alphaNew = min(P.Ci, max(beta - lam * y, 0));
         end
 
-        converged = norm(alphaNew - alpha) <= opts.tol * max(1, norm(alpha));
+        dA = alphaNew - alpha;
+        converged = norm(dA) <= opts.tol * max(1, norm(alpha));
+
+        % Momentum coefficient (0 = plain PG or restart).
+        theta = 0;
+        if opts.accel
+            if (z - alphaNew)' * dA > 0
+                tk = 1;
+            else
+                tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+                theta = (tk - 1) / tk1;
+                tk = tk1;
+            end
+        end
+        z = alphaNew + theta * dA;
+
+        % Lazy kernel-image maintenance: bound coordinates have dA_i = 0
+        % exactly (clip -> clip), so late-phase deltas are supported on
+        % the free SVs only and K*dA is a cheap sparse matvec. z is a
+        % linear combination of the last two alphas, so K*z falls out of
+        % the two maintained images with no extra matvec.
+        sinceRefresh = sinceRefresh + 1;
+        gaPrev = ga;
+        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
+            ga = ga + ker.mul(sparse(dA));
+        else
+            ga = ker.mul(alphaNew); % periodic full refresh
+            sinceRefresh = 0;
+        end
+        gz = ga + theta * (ga - gaPrev);
+
         alpha = alphaNew;
         if converged
             break;
@@ -586,13 +734,29 @@ function out = solve_l1l2(ker, y, P, opts)
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
 
-
+%====% SVR %====%
+% Equation 10: min_beta .5*beta'*K*beta - y'*beta + epsilon||beta||_1, s.t. 1'*beta = 0, ||beta||_inf <= C.
+%
+% SVR:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% Ensure: optimial beta to Eq 10
+% while not converged do
+%         v <- beta - 1/L(K*beta-y)
+%         lambda: sum^n_i clip(S_{epsilon/L}(v_i - lambda), -C, C)=0 via bisection
+%         beta <- clip(S_{epsilon/L}(v-lambda*1), -C, C)
+% end while
 function out = solve_svr(ker, y, P, opts)
     n = numel(y);
     L = ker.sig1;
     thr = P.eps / L;
+    st = @(u) sign(u) .* max(abs(u) - thr, 0);   % soft threshold S_{eps/L}
 
     b = zeros(n, 1);
+    z = b;
+    tk = 1;
+    gb = zeros(n, 1); % maintained K*b
+    gz = zeros(n, 1); % maintained K*z
+    sinceRefresh = 0;
     hist = init_hist();
     clk = clk_new(P.chargedSetup);
 
@@ -600,12 +764,9 @@ function out = solve_svr(ker, y, P, opts)
     while it < opts.maxIters
         it = it + 1;
 
-        g = ker.mul(b);
-        grad = g - y;
-
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
-            f = plotted_objective(P, b, g, y);
+            f = plotted_objective(P, b, gb, y); % free: gb is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
         end
@@ -615,13 +776,36 @@ function out = solve_svr(ker, y, P, opts)
             break;
         end
 
-        v = b - grad / L;
-        st = @(u) sign(u) .* max(abs(u) - thr, 0);   % soft threshold S_{eps/L}
+        v = z - (gz - y) / L;
         h = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
         lam = bisect_root(h, max(1, max(abs(v))));
         bNew = min(P.bUp, max(P.bLo, st(v - lam)));
 
-        converged = norm(bNew - b) <= opts.tol * max(1, norm(b));
+        dB = bNew - b;
+        converged = norm(dB) <= opts.tol * max(1, norm(b));
+
+        theta = 0;
+        if opts.accel
+            if (z - bNew)' * dB > 0 % gradient restart
+                tk = 1;
+            else
+                tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+                theta = (tk - 1) / tk1;
+                tk = tk1;
+            end
+        end
+        z = bNew + theta * dB;
+
+        sinceRefresh = sinceRefresh + 1;
+        gbPrev = gb;
+        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dB) < 0.5 * n
+            gb = gb + ker.mul(sparse(dB));
+        else
+            gb = ker.mul(bNew);
+            sinceRefresh = 0;
+        end
+        gz = gb + theta * (gb - gbPrev);
+
         b = bNew;
         if converged
             break;
@@ -635,7 +819,18 @@ function out = solve_svr(ker, y, P, opts)
     out = struct('alpha', b, 'hist', hist, 'iters', it, 'skipped', false);
 end
 
-
+%====% Multiclass SVM %====%
+% Equation 16: min{C, max{0,b^(t)_(i,y_i) - lambda_i}} + sum_(j!=y_i) min{0, max{-C, b^(t)_(i,j) - lambda_i}} = 0
+%
+% Jacobi-style parallel update for multiclass SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% for t = 0,1,2,... until convergence do
+%     B^(t) <- alpha^(t) - 1/L(K*alpha^(t) - 1_ind)
+%     for i = 1,...,n in parallel
+%         Find lambda_i satisfying Eq 16 using bisection
+%         alpha^(t+1)_(i,y_i) <- min{C, max{0,b^(t)_(i,y_i) - lambda_i}}, alpha^(t)_(i,j) - lambda_i}{j!=y_i}
+%     end for
+% end for
 function out = solve_mcsvm(ker, y, P, opts)
     n = numel(y);
     K = P.K;
@@ -647,6 +842,11 @@ function out = solve_mcsvm(ker, y, P, opts)
     LO = (E - 1) .* CiK;                             % [-C_i, 0] elsewhere
 
     alpha = zeros(n, K);
+    Z = alpha;
+    tk = 1;
+    GA = zeros(n, K); % maintained K*alpha
+    GZ = zeros(n, K); % maintained K*Z
+    sinceRefresh = 0;
     hist = init_hist();
     clk = clk_new(P.chargedSetup);
 
@@ -654,11 +854,9 @@ function out = solve_mcsvm(ker, y, P, opts)
     while it < opts.maxIters
         it = it + 1;
 
-        G = ker.mul(alpha);                          % n x K
-
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
-            f = plotted_objective(P, alpha, G, y);
+            f = plotted_objective(P, alpha, GA, y); % free: GA is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
         end
@@ -668,7 +866,7 @@ function out = solve_mcsvm(ker, y, P, opts)
             break;
         end
 
-        B = alpha - (G - E) / L;
+        B = Z - (GZ - E) / L;
 
         % Eq 16 for every row simultaneously: each h_i is nonincreasing in
         % lambda_i, positive at lo and nonpositive at hi, so a vectorized
@@ -685,7 +883,34 @@ function out = solve_mcsvm(ker, y, P, opts)
         mid = (lo + hi) / 2;
         alphaNew = min(UP, max(LO, bsxfun(@minus, B, mid)));
 
-        converged = norm(alphaNew(:) - alpha(:)) <= opts.tol * max(1, norm(alpha(:)));
+        dA = alphaNew - alpha;
+        converged = norm(dA(:)) <= opts.tol * max(1, norm(alpha(:)));
+
+        theta = 0;
+        if opts.accel
+            if sum(sum((Z - alphaNew) .* dA)) > 0 % gradient restart
+                tk = 1;
+            else
+                tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+                theta = (tk - 1) / tk1;
+                tk = tk1;
+            end
+        end
+        Z = alphaNew + theta * dA;
+
+        % Lazy maintenance: rows whose every coordinate stayed clipped at
+        % its bound have an all-zero delta row, so K*dA touches only the
+        % active rows (sparse fast paths in all three kernel modes).
+        sinceRefresh = sinceRefresh + 1;
+        GAPrev = GA;
+        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * numel(dA)
+            GA = GA + ker.mul(sparse(dA));
+        else
+            GA = ker.mul(alphaNew);
+            sinceRefresh = 0;
+        end
+        GZ = GA + theta * (GA - GAPrev);
+
         alpha = alphaNew;
         if converged
             break;
@@ -699,7 +924,22 @@ function out = solve_mcsvm(ker, y, P, opts)
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
 
-
+%====% Nu-SVM %====%
+% Equation 21: sum^n_i y_i min{1/n, max{0, beta_i^(t) - lambda*y_i}} = 0
+% Equation 22: alpha_i = min{1/n, max{0, beta_i^(t) - lambda_+}}, y_i = +1; alpha_i = min{1/n, max{0, beta^(t)_i - lambda_-}}, y_i = -1;
+% Equation 23: sum_(i:y_i=+1) min{1/n, max{0, beta_i^(t) - lambda_+}} = nu/2; sum_(i:y_i=-1) min{1/n, max{0, beta^(t)_i - lambda_-}} = nu/2;
+%
+% nu-SVM:
+% Given C, (x_i, y_i)^n_i, formulate K, L = sigma_1(K), initalize beta = 0.
+% for t = 0,1,2,... until convergence do
+%     B^(t) <- alpha^(t) - 1/L*K*alpha^(t)
+%     alpha_i <- min{1/n, max{0, beta_i^(t) - lambda*y_i}}
+%     if sum^n_i alpha_i < nu then
+%         solve Eq 23 using bisection
+%         Update alpha via Eq 22
+%     end if
+%     alpha^(t+1) <- alpha
+% end for
 function out = solve_nusvm(ker, y, P, opts)
     n = numel(y);
     L = ker.sig1;
@@ -708,6 +948,11 @@ function out = solve_nusvm(ker, y, P, opts)
     im = ~ip;
 
     alpha = zeros(n, 1);
+    z = alpha;
+    tk = 1;
+    ga = zeros(n, 1); % maintained K*alpha
+    gz = zeros(n, 1); % maintained K*z
+    sinceRefresh = 0;
     hist = init_hist();
     clk = clk_new(P.chargedSetup);
 
@@ -715,14 +960,12 @@ function out = solve_nusvm(ker, y, P, opts)
     while it < opts.maxIters
         it = it + 1;
 
-        g = ker.mul(alpha);
-
         clk = clk_pause(clk);
         % alpha = 0 (it == 1) violates sum(alpha) >= nu and has f = 0 < f*,
         % which would wreck a log suboptimality plot, so recording starts
         % once the iterate is feasible (after the first projection).
         if it > 1 && mod(it - 1, opts.evalEvery) == 0
-            f = plotted_objective(P, alpha, g, y);
+            f = plotted_objective(P, alpha, ga, y); % free: ga is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
         end
@@ -732,7 +975,7 @@ function out = solve_nusvm(ker, y, P, opts)
             break;
         end
 
-        B = alpha - g / L;
+        B = z - gz / L;
 
         % Eq 21: project onto {0 <= a <= up, y'a = 0}
         h = @(lam) sum(y .* min(up, max(B - lam * y, 0)));
@@ -750,7 +993,31 @@ function out = solve_nusvm(ker, y, P, opts)
             a(im) = min(up(im), max(B(im) - lm, 0));
         end
 
-        converged = norm(a - alpha) <= opts.tol * max(1, norm(alpha));
+        dA = a - alpha;
+        converged = norm(dA) <= opts.tol * max(1, norm(alpha));
+
+        theta = 0;
+        if opts.accel
+            if (z - a)' * dA > 0 % gradient restart
+                tk = 1;
+            else
+                tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+                theta = (tk - 1) / tk1;
+                tk = tk1;
+            end
+        end
+        z = a + theta * dA;
+
+        sinceRefresh = sinceRefresh + 1;
+        gaPrev = ga;
+        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
+            ga = ga + ker.mul(sparse(dA));
+        else
+            ga = ker.mul(a);
+            sinceRefresh = 0;
+        end
+        gz = ga + theta * (ga - gaPrev);
+
         alpha = a;
         if converged
             break;
@@ -1033,6 +1300,8 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     xlabel('Solver time (s)');
     ylabel(ylab);
     title(strrep(ttl, '_', '\_'));
+    legend('Location', 'best');
+    saveas(fig, figPath);
     legend('Location', 'best');
     saveas(fig, figPath);
     close(fig);
