@@ -201,7 +201,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'mcBins', 4);
     opts = set_default(opts, 'maxIters', 5000);
     opts = set_default(opts, 'tol', 1e-10);
-    opts = set_default(opts, 'timeLimit', 60);
+    opts = set_default(opts, 'timeLimit', 360);
     opts = set_default(opts, 'evalEvery', 1);
     opts = set_default(opts, 'printEvery', 200);
     opts = set_default(opts, 'maxSamples', inf);
@@ -1089,10 +1089,19 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 
     out.skipped = false;
 
-    % Starting point of any iterative method: alpha = 0 (skip for nusvm,
-    % where alpha = 0 is infeasible and f(0) = 0 < f*).
-    if ~strcmp(P.name, 'nusvm')
-        z0 = zeros(n, 1);
+    % Starting point
+    z0 = zeros(n, 1);
+    if strcmp(P.name, 'nusvm')
+        ip = (y > 0);
+        im = ~ip;
+        hp = @(l) sum(min(P.up(ip), max(-l, 0))) - P.nu / 2;
+        hm = @(l) sum(min(P.up(im), max(-l, 0))) - P.nu / 2;
+        lp = bisect_root(hp, 1);
+        lm = bisect_root(hm, 1);
+        z0(ip) = min(P.up(ip), max(-lp, 0));
+        z0(im) = min(P.up(im), max(-lm, 0));
+        hist = rec_hist(hist, 0, plotted_objective(P, z0, ker.mul(z0), y));
+    else
         hist = rec_hist(hist, 0, plotted_objective(P, z0, zeros(n, 1), y));
     end
 
@@ -1111,27 +1120,37 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
         a = zeros(n, 1);
         switch P.name
             case {'l1svm', 'l2svm'}
-                a(model.sv_indices) = abs(model.sv_coef);   % |y_i alpha_i| = alpha_i
+                a(model.sv_indices) = abs(model.sv_coef); % |y_i alpha_i| = alpha_i
             case 'nusvm'
-                % LIBSVM rescales nu-SVC alphas internally (by 1/rho'); the
-                % direction is exact, so restore the scale via the active
-                % constraint sum(alpha) = nu.   TODO(verify) once vs a
-                % small run: alpha should satisfy 0 <= alpha <= 1/n.
+                % LIBSVM rescales nu-SVC alphas internally; the direction
+                % is exact, so restore the scale via the active constraint
+                % sum(alpha) = nu, then repair the residual constraint
+                % error exactly by projecting onto {0 <= a <= up,
+                % per-class mass = nu/2} (two bisections, same structure
+                % as Eq 23). Without the repair the small violations show
+                % up as a fake accuracy floor for the baseline.
                 a(model.sv_indices) = abs(model.sv_coef);
                 s = sum(a);
                 if s > 0
                     a = a * (P.nu / s);
                 end
-                a = min(a, P.up);
+                ip = (y > 0);
+                im = ~ip;
+                hp = @(l) sum(min(P.up(ip), max(a(ip) - l, 0))) - P.nu / 2;
+                hm = @(l) sum(min(P.up(im), max(a(im) - l, 0))) - P.nu / 2;
+                lp = bisect_root(hp, max(1, max(abs(a))));
+                lm = bisect_root(hm, max(1, max(abs(a))));
+                a(ip) = min(P.up(ip), max(a(ip) - lp, 0));
+                a(im) = min(P.up(im), max(a(im) - lm, 0));
             case 'svr'
-                a(model.sv_indices) = model.sv_coef;        % beta = alpha - alpha*
+                a(model.sv_indices) = model.sv_coef; % beta = alpha - alpha*
         end
 
         f = plotted_objective(P, a, ker.mul(a), y);
         hist = rec_hist(hist, tTrain, f);
         maybe_print(opts, 'smo-libsvm', t, f);
         if tTrain >= opts.timeLimit
-            break;                          % tighter tolerances only slower
+            break; % tighter tolerances only slower
         end
     end
 
