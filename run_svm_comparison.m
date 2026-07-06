@@ -10,6 +10,8 @@ function results = run_svm_comparison(matFile, opts)
     % ========== %
 
 %===%  L1/L2 SVM ('l1svm' 'l2svm')
+% Equation 1: min_(w,b,e) .5*||w||^2_2 + C*sum^n_i e_i, s.t. y_i(w'*x_i + b) >= 1 - e_i, e_i >= 0, i=1,...,n
+% Equation 2: max_alpha sum^n_i alpha_i - .5*sum^n_i sum^n_j alpha_i * alpha_j * y_i * y_j * x'_i * x_j, s.t. 0 <= alpha_i <= C, sum^n_i alpha_i * y_i = 0
 % Equation 5: min_alpha f(alpha) = .5 alpha'*K*alpha + 1/(2*C) ||alpha||^2_2 - alpha'*1, s.t. alpha >= 0, <alpha, y> = 0.
 %
 % L2-SVM or L1-SVM:
@@ -201,7 +203,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'mcBins', 4);
     opts = set_default(opts, 'maxIters', 5000);
     opts = set_default(opts, 'tol', 1e-10);
-    opts = set_default(opts, 'timeLimit', 360);
+    opts = set_default(opts, 'timeLimit', 60);
     opts = set_default(opts, 'evalEvery', 1);
     opts = set_default(opts, 'printEvery', 200);
     opts = set_default(opts, 'maxSamples', inf);
@@ -836,10 +838,10 @@ function out = solve_mcsvm(ker, y, P, opts)
     K = P.K;
     L = ker.sig1;
 
-    E = full(sparse((1:n)', y, 1, n, K));            % 1_ind
+    E = full(sparse((1:n)', y, 1, n, K)); % 1_ind
     CiK = repmat(P.Ci, 1, K);
-    UP = E .* CiK;                                   % [0, C_i] at true class
-    LO = (E - 1) .* CiK;                             % [-C_i, 0] elsewhere
+    UP = E .* CiK; % [0, C_i] at true class
+    LO = (E - 1) .* CiK; % [-C_i, 0] elsewhere
 
     alpha = zeros(n, K);
     Z = alpha;
@@ -1043,9 +1045,15 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
     n = size(X, 1);
     useKtil = false;
 
+    if strcmp(opts.kernel, 'rbf')
+        kpart = sprintf('-t 2 -g %.10g', opts.rbfGamma); % LIBSVM RBF, matched gamma
+    else
+        kpart = '-t 0'; % linear
+    end
+
     switch P.name
         case 'l1svm'
-            base = sprintf('-s 0 -t 0 -c %.10g', P.C);
+            base = sprintf('-s 0 %s -c %.10g', kpart, P.C);
             if strcmp(P.costMode, 'cost')
                 % per-class boxes via -wi (box becomes C * w_class)
                 wp = P.Ci(find(y > 0, 1)) / P.C;
@@ -1069,20 +1077,24 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
                 warning('Stock LIBSVM has no weighted nu-SVC; skipping baseline.');
                 return;
             end
-            base = sprintf('-s 1 -t 0 -n %.10g', P.nu);
+            base = sprintf('-s 1 %s -n %.10g', kpart, P.nu);
         case 'svr'
             if strcmp(P.costMode, 'cost')
                 warning('Stock LIBSVM eps-SVR has one C (no asymmetric box); skipping baseline.');
                 return;
             end
-            base = sprintf('-s 3 -t 0 -c %.10g -p %.10g', P.C, P.eps);
+            base = sprintf('-s 3 %s -c %.10g -p %.10g', kpart, P.C, P.eps);
         otherwise
             return;
     end
 
     % One-off conversions, excluded from the recorded training times.
     if useKtil
-        Ktr = [(1:n)', full(X * X') + diag(1 ./ P.Ci)];
+        if strcmp(opts.kernel, 'rbf')
+            Ktr = [(1:n)', rbf_gram(X, X, opts.rbfGamma) + diag(1 ./ P.Ci)]; % RBF
+        else
+            Ktr = [(1:n)', full(X * X') + diag(1 ./ P.Ci)]; % linear
+        end
     else
         Xsp = sparse(X);
     end
@@ -1201,8 +1213,6 @@ function out = baseline_liblinear_mcsvm(X, y, P, opts)
         model = feval(fn, y, Xsp, args);
         tTrain = toc(tS);
 
-        % TODO(verify): w shape / Label order differ across liblinear
-        % versions; check once on a tiny 3-class example.
         Wm = model.w;
         if size(Wm, 1) == P.K && size(Wm, 2) == d
             Wm = Wm';
