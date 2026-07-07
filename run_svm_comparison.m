@@ -208,7 +208,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'printEvery', 200);
     opts = set_default(opts, 'maxSamples', inf);
     opts = set_default(opts, 'standardize', false);
-    opts = set_default(opts, 'standardizeY', true);
+    opts = set_default(opts, 'standardizeY', false);
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
     opts = set_default(opts, 'smoTolerances', 10.^-(1:8));
     opts = set_default(opts, 'liblinearFn', 'train');
@@ -241,7 +241,6 @@ end
 % ======================================================================
 
 function [X, y] = load_xy_from_mat(matFile)
-% Sniff (X, y) from common variable names, fall back to shape matching.
     S = load(matFile);
 
     xCandidates = {'Z', 'X', 'data', 'features', 'A', 'x'};
@@ -612,8 +611,6 @@ function f = plotted_objective(P, a, g, y)
         case 'svr'
             f = 0.5 * (a' * g) - y' * a + P.eps * sum(abs(a));
         case 'mcsvm'
-            % PRIMAL of the Crammer-Singer problem (see header): with
-            % W = X'a we have ||W||_F^2 = <a, g> and scores S = XW = g.
             n = numel(y);
             idxTrue = sub2ind(size(g), (1:n)', y);
             Drow = 1 - full(sparse((1:n)', y, 1, n, P.K));   % Delta(y_i,:)
@@ -1055,14 +1052,11 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
         case 'l1svm'
             base = sprintf('-s 0 %s -c %.10g', kpart, P.C);
             if strcmp(P.costMode, 'cost')
-                % per-class boxes via -wi (box becomes C * w_class)
                 wp = P.Ci(find(y > 0, 1)) / P.C;
                 wm = P.Ci(find(y < 0, 1)) / P.C;
                 base = sprintf('%s -w1 %.10g -w-1 %.10g', base, wp, wm);
             end
         case 'l2svm'
-            % L2-SVM == hard-margin SMO on K + diag(1./C_i): solve with a
-            % precomputed kernel and an effectively infinite box.
             if n > opts.explicitKernelMaxN
                 warning(['l2svm SMO baseline needs the explicit %d x %d kernel ', ...
                          '(> opts.explicitKernelMaxN = %d); skipping.'], ...
@@ -1172,10 +1166,7 @@ end
 
 
 function out = baseline_liblinear_mcsvm(X, y, P, opts)
-% Crammer-Singer baseline via LIBLINEAR -s 4 (sequential dual coordinate
-% descent). LIBLINEAR never exposes its dual variables, so this baseline
-% is scored on the shared PRIMAL objective from the returned W (their
-% -s 4 problem is bias-free, exactly like Eq 16).
+% Seqeuntial dual coordinate descent
     hist = init_hist();
     out = struct('W', [], 'hist', hist, 'skipped', true);
 
