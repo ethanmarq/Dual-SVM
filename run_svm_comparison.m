@@ -693,17 +693,20 @@ function out = solve_l1l2(ker, y, P, opts)
         converged = norm(dA) <= opts.tol * max(1, norm(alpha));
 
         % Momentum coefficient (0 = plain PG or restart).
-        theta = 0;
-        if opts.accel
-            if (z - alphaNew)' * dA > 0
-                tk = 1;
-            else
-                tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
-                theta = (tk - 1) / tk1;
-                tk = tk1;
-            end
-        end
+        [theta, tk] = momentum_step(opts, mu, L, tk, (z - alphaNew)' * dA);
         z = alphaNew + theta * dA;
+
+        % theta = 0;
+        % if opts.accel
+        %     if (z - alphaNew)' * dA > 0
+        %         tk = 1;
+        %     else
+        %         tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+        %         theta = (tk - 1) / tk1;
+        %         tk = tk1;
+        %     end
+        % end
+        % z = alphaNew + theta * dA;
 
         % Lazy kernel-image maintenance: bound coordinates have dA_i = 0
         % exactly (clip -> clip), so late-phase deltas are supported on
@@ -1222,6 +1225,37 @@ function out = baseline_liblinear_mcsvm(X, y, P, opts)
 
     out.W = W;
     out.hist = hist;
+end
+
+function [theta, tk] = momentum_step(opts, mu, L, tk, restartStat)
+% restartStat = <z - x_new, x_new - x_old>. > 0 means the momentum
+% direction is fighting the latest projected step -> restart.
+    theta = 0;
+    if ~opts.accel
+        return;
+    end
+    if mu > 0
+        % Strongly convex: constant momentum from the known modulus,
+        % beta = (sqrt(L) - sqrt(mu)) / (sqrt(L) + sqrt(mu)). The gradient
+        % restart is kept as a safeguard: it never hurts and helps when
+        % the local curvature on the active manifold exceeds the global
+        % mu.
+        if restartStat > 0
+            theta = 0;
+        else
+            rq = sqrt(mu / L);
+            theta = (1 - rq) / (1 + rq);
+        end
+    else
+        % mu = 0: adaptive restart-FISTA
+        if restartStat > 0
+            tk = 1;
+        else
+            tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
+            theta = (tk - 1) / tk1;
+            tk = tk1;
+        end
+    end
 end
 
 
