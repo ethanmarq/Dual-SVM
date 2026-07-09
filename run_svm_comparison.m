@@ -192,6 +192,11 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'lazy', true);       % incremental K*delta updates
     opts = set_default(opts, 'lazyRefresh', 100); % full recompute cadence
                                                   % (guards FP drift)
+
+    opts = set_default(opts, 'precond', 'none');   % 'none' | 'nystrom' (l1svm only)
+    opts = set_default(opts, 'precondRank', 50);   % r landmarks
+    opts = set_default(opts, 'precondSafety', 1.0);% ~1.1 if non-monotone
+
     opts = set_default(opts, 'C', 1);
     opts = set_default(opts, 'nu', 0.2);
     opts = set_default(opts, 'epsSVR', 0.1);
@@ -203,12 +208,12 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'mcBins', 4);
     opts = set_default(opts, 'maxIters', 5000);
     opts = set_default(opts, 'tol', 1e-10);
-    opts = set_default(opts, 'timeLimit', 360);
-    opts = set_default(opts, 'evalEvery', 1);
+    opts = set_default(opts, 'timeLimit', 60);
+    opts = set_default(opts, 'evalEvery', 10);
     opts = set_default(opts, 'printEvery', 200);
     opts = set_default(opts, 'maxSamples', inf);
-    opts = set_default(opts, 'standardize', false);
-    opts = set_default(opts, 'standardizeY', false);
+    opts = set_default(opts, 'standardize', true);
+    opts = set_default(opts, 'standardizeY', true);
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
     opts = set_default(opts, 'smoTolerances', 10.^-(1:8));
     opts = set_default(opts, 'liblinearFn', 'train');
@@ -692,7 +697,12 @@ function out = solve_l1l2(ker, y, P, opts)
         dA = alphaNew - alpha;
         converged = norm(dA) <= opts.tol * max(1, norm(alpha));
 
-        % Momentum coefficient (0 = plain PG or restart).
+        if isL2 % Stongly convex
+            mu = 1 / max(P.Ci);
+        else % Not strongly convex
+            mu = 0;
+        end
+        [theta, tk] = momentum_step(opts, mu, L, tk, (z - alphaNew)' * dA);
         [theta, tk] = momentum_step(opts, mu, L, tk, (z - alphaNew)' * dA);
         z = alphaNew + theta * dA;
 
@@ -730,8 +740,7 @@ function out = solve_l1l2(ker, y, P, opts)
     end
 
     clk = clk_pause(clk);
-    g = ker.mul(alpha); % final point, off-clock
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -815,8 +824,7 @@ function out = solve_svr(ker, y, P, opts)
     end
 
     clk = clk_pause(clk);
-    g = ker.mul(b);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, ker.mul(b), y));
 
     out = struct('alpha', b, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -858,6 +866,7 @@ function out = solve_mcsvm(ker, y, P, opts)
 
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
+            % f = plotted_objective(P, alpha, ker.mul(alpha), y);
             f = plotted_objective(P, alpha, GA, y); % free: GA is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
@@ -920,8 +929,8 @@ function out = solve_mcsvm(ker, y, P, opts)
     end
 
     clk = clk_pause(clk);
-    G = ker.mul(alpha);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, G, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
+
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -1028,7 +1037,7 @@ function out = solve_nusvm(ker, y, P, opts)
 
     clk = clk_pause(clk);
     g = ker.mul(alpha);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -1227,6 +1236,11 @@ function out = baseline_liblinear_mcsvm(X, y, P, opts)
     out.hist = hist;
 end
 
+
+% ===
+% Helpers
+% ===
+
 function [theta, tk] = momentum_step(opts, mu, L, tk, restartStat)
 % restartStat = <z - x_new, x_new - x_old>. > 0 means the momentum
 % direction is fighting the latest projected step -> restart.
@@ -1247,7 +1261,7 @@ function [theta, tk] = momentum_step(opts, mu, L, tk, restartStat)
             theta = (1 - rq) / (1 + rq);
         end
     else
-        % mu = 0: adaptive restart-FISTA
+        % mu = 0: adaptive restart-FIST A
         if restartStat > 0
             tk = 1;
         else
