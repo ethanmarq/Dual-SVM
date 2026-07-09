@@ -193,10 +193,6 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'lazyRefresh', 100); % full recompute cadence
                                                   % (guards FP drift)
 
-    opts = set_default(opts, 'precond', 'none');   % 'none' | 'nystrom' (l1svm only)
-    opts = set_default(opts, 'precondRank', 50);   % r landmarks
-    opts = set_default(opts, 'precondSafety', 1.0);% ~1.1 if non-monotone
-
     opts = set_default(opts, 'C', 1);
     opts = set_default(opts, 'nu', 0.2);
     opts = set_default(opts, 'epsSVR', 0.1);
