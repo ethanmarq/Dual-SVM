@@ -141,8 +141,8 @@ function results = run_svm_comparison(matFile, opts)
 
     % ---- baseline --------------------------------------------------------
     if strcmp(P.name, 'mcsvm')
-        baseOut = baseline_liblinear_mcsvm(X, y, P, opts);
-        baseLabel = 'LIBLINEAR -s 4 (CS dual CD, tol sweep)';
+        baseOut   = baseline_smo_mcsvm(ker, X, y, P, opts);   % SMO family
+        baseLabel = 'CS SMO (max-violating pair, analytic step)';
     else
         baseOut = baseline_libsvm_sweep(ker, X, y, P, opts);
         baseLabel = 'LIBSVM SMO (tol sweep)';
@@ -155,11 +155,7 @@ function results = run_svm_comparison(matFile, opts)
         hists{end+1} = baseOut.hist;
         labels{end+1} = baseLabel;
     end
-    if strcmp(P.name, 'mcsvm')
-        ylab = 'Primal suboptimality  P - P*';
-    else
-        ylab = 'Dual suboptimality  f - f*';
-    end
+    ylab = 'Dual suboptimality  f - f*';
     ttl = sprintf('%s: %s (%s)', datasetName, P.name, opts.costMode);
     if opts.makeFigure
         make_config_figure(hists, labels, figPath, ttl, ylab);
@@ -612,11 +608,16 @@ function f = plotted_objective(P, a, g, y)
         case 'svr'
             f = 0.5 * (a' * g) - y' * a + P.eps * sum(abs(a));
         case 'mcsvm'
-            n = numel(y);
-            idxTrue = sub2ind(size(g), (1:n)', y);
-            Drow = 1 - full(sparse((1:n)', y, 1, n, P.K));   % Delta(y_i,:)
-            loss = max(Drow + g, [], 2) - g(idxTrue);
-            f = 0.5 * sum(sum(a .* g)) + sum(P.Ci .* loss);
+        % DUAL objective d(a) = 1/2 <a, K a> - <E, a>. This is exactly the
+        % function solve_mcsvm and baseline_smo_mcsvm minimize (grad = K a - E).
+        % Both maintain a and g = K a, so it's free and shares d*.
+        n = numel(y);
+        idxTrue = sub2ind(size(a), (1:n)', y);
+        f = 0.5 * sum(sum(a .* g)) - sum(a(idxTrue));
+        % --- primal (previous behavior), kept for reference ---
+        % Drow = 1 - full(sparse((1:n)', y, 1, n, P.K));
+        % loss = max(Drow + g, [], 2) - g(idxTrue);
+        % f = 0.5 * sum(sum(a .* g)) + sum(P.Ci .* loss);
     end
 end
 
@@ -1173,65 +1174,85 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 end
 
 
-function out = baseline_liblinear_mcsvm(X, y, P, opts)
-% Seqeuntial dual coordinate descent
+function out = baseline_smo_mcsvm(ker, X, y, P, opts)
+% Kernelized Crammer-Singer SMO baseline: maximal-violating-PAIR working set
+% (two classes within one example) + analytic 2-variable step. This is the
+% SMO *family* -- same as the LIBSVM binary baselines -- as opposed to the
+% row-block coordinate descent in baseline_csdecomp_mcsvm (the LIBLINEAR -s 4
+% family). Same dual, same ker operator => shares P* with solve_mcsvm.
     hist = init_hist();
-    out = struct('W', [], 'hist', hist, 'skipped', true);
+    out  = struct('alpha', [], 'hist', hist, 'skipped', false);
 
-    fn = opts.liblinearFn;
-    if exist(fn, 'file') ~= 3
-        warning('LIBLINEAR mex (%s) not on path; skipping CS baseline.', fn);
-        return;
+    n = numel(y);   K = P.K;
+    E   = full(sparse((1:n)', y, 1, n, K));
+    CiK = repmat(P.Ci, 1, K);
+    UP  = E .* CiK;            % [0, C_i] at true class
+    LO  = (E - 1) .* CiK;      % [-C_i, 0] elsewhere
+
+    if ker.explicit
+        Kdiag = full(diag(ker.K));
+    elseif strcmp(opts.kernel, 'rbf')
+        Kdiag = ones(n, 1);            % exp(0) = 1
+    else
+        Kdiag = full(sum(X.^2, 2));    % linear
     end
+    Kdiag = max(Kdiag, 1e-12);
 
-    n = size(X, 1);
-    d = size(X, 2);
-    base = sprintf('-s 4 -c %.10g', P.C);
-    if strcmp(P.costMode, 'cost')
-        for k = 1:P.K
-            wk = P.Ci(find(y == k, 1)) / P.C;
-            base = sprintf('%s -w%d %.10g', base, k, wk);
-        end
-    end
+    alpha = zeros(n, K);
+    KA    = zeros(n, K);       % maintained K*alpha (= scores), alpha=0 -> 0
+    epsB  = 1e-12;             % box-activity tolerance for eligibility
+    clk   = clk_new(0);
+    hist  = rec_hist(hist, 0, plotted_objective(P, alpha, KA, y));
 
-    Xsp = sparse(X);
-    idxTrue = sub2ind([n, P.K], (1:n)', y);
-    Drow = 1 - full(sparse((1:n)', y, 1, n, P.K));
-    out.skipped = false;
+    chkEvery = max(1, n);              % record / time-check cadence (~1 epoch)
+    maxSteps = opts.maxIters * max(1, n);
+    s = 0;
+    while s < maxSteps
+        s = s + 1;
 
-    % alpha = 0 <=> W = 0 starting point
-    S0 = zeros(n, P.K);
-    f0 = sum(P.Ci .* (max(Drow + S0, [], 2) - S0(idxTrue)));
-    hist = rec_hist(hist, 0, f0);
-
-    W = zeros(d, P.K);
-    tolList = opts.smoTolerances(:)';
-    for t = 1:numel(tolList)
-        args = sprintf('%s -e %.3g -q', base, tolList(t));
-        tS = tic;
-        model = feval(fn, y, Xsp, args);
-        tTrain = toc(tS);
-
-        Wm = model.w;
-        if size(Wm, 1) == P.K && size(Wm, 2) == d
-            Wm = Wm';
-        end
-        W = zeros(d, P.K);
-        W(:, model.Label) = Wm;
-
-        S = X * W;
-        f = 0.5 * sum(W(:).^2) + sum(P.Ci .* (max(Drow + S, [], 2) - S(idxTrue)));
-        hist = rec_hist(hist, tTrain, f);
-        maybe_print(opts, 'liblinear-cs', t, f);
-        if tTrain >= opts.timeLimit
+        % ---- maximal violating pair, vectorized over all rows ----------
+        G = KA - E;                                   % gradient K*alpha - E
+        Gup = G;  Gup(alpha >= UP - epsB) = +inf;     % classes that can go UP
+        Gdn = G;  Gdn(alpha <= LO + epsB) = -inf;     % classes that can go DOWN
+        [GminUp, uIdx] = min(Gup, [], 2);
+        [GmaxDn, vIdx] = max(Gdn, [], 2);
+        viol = GmaxDn - GminUp;                       % KKT violation per row
+        [mviol, i] = max(viol);
+        if ~(mviol > opts.tol)                        % KKT-satisfied to tol
             break;
         end
+
+        % ---- analytic 2-variable step in row i: a_u += t, a_v -= t ------
+        u = uIdx(i);   v = vIdx(i);
+        t = mviol / (2 * Kdiag(i));                                % free min
+        t = min([t, UP(i,u) - alpha(i,u), alpha(i,v) - LO(i,v)]);  % clip box
+        alpha(i,u) = alpha(i,u) + t;
+        alpha(i,v) = alpha(i,v) - t;
+        if ker.explicit
+            Ki = ker.K(:, i);
+        else
+            Ki = ker.mul(sparse(i, 1, 1, n, 1));      % K(:,i) via one matvec
+        end
+        KA(:,u) = KA(:,u) + t * Ki;                   % refresh only 2 columns
+        KA(:,v) = KA(:,v) - t * Ki;
+
+        % ---- record / time gate ----------------------------------------
+        if mod(s, chkEvery) == 0
+            clk  = clk_pause(clk);
+            f    = plotted_objective(P, alpha, KA, y);
+            hist = rec_hist(hist, clk.solve, f);
+            maybe_print(opts, 'smo-cs', s, f);
+            stop = clk.solve >= opts.timeLimit;
+            clk  = clk_resume(clk);
+            if stop, break; end
+        end
     end
 
-    out.W = W;
-    out.hist = hist;
+    clk  = clk_pause(clk);
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
+    out.alpha = alpha;
+    out.hist  = hist;
 end
-
 
 % ===
 % Helpers
