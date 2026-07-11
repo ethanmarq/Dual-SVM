@@ -1175,36 +1175,34 @@ end
 
 
 function out = baseline_smo_mcsvm(ker, X, y, P, opts)
-% Kernelized Crammer-Singer SMO baseline: maximal-violating-PAIR working set
-% (two classes within one example) + analytic 2-variable step. This is the
-% SMO *family* -- same as the LIBSVM binary baselines -- as opposed to the
-% row-block coordinate descent in baseline_csdecomp_mcsvm (the LIBLINEAR -s 4
-% family). Same dual, same ker operator => shares P* with solve_mcsvm.
+% Kernelized Crammer-Singer SMO
+% maximal-violating-pair working set
+% (twe classes in one example) and analytic 2-variable step
     hist = init_hist();
     out  = struct('alpha', [], 'hist', hist, 'skipped', false);
 
     n = numel(y);   K = P.K;
     E   = full(sparse((1:n)', y, 1, n, K));
     CiK = repmat(P.Ci, 1, K);
-    UP  = E .* CiK;            % [0, C_i] at true class
-    LO  = (E - 1) .* CiK;      % [-C_i, 0] elsewhere
+    UP  = E .* CiK; % [0, C_i] at true class
+    LO  = (E - 1) .* CiK; % [-C_i, 0] elsewhere
 
     if ker.explicit
         Kdiag = full(diag(ker.K));
     elseif strcmp(opts.kernel, 'rbf')
-        Kdiag = ones(n, 1);            % exp(0) = 1
+        Kdiag = ones(n, 1); % exp(0) = 1
     else
-        Kdiag = full(sum(X.^2, 2));    % linear
+        Kdiag = full(sum(X.^2, 2)); % linear
     end
     Kdiag = max(Kdiag, 1e-12);
 
     alpha = zeros(n, K);
-    KA    = zeros(n, K);       % maintained K*alpha (= scores), alpha=0 -> 0
-    epsB  = 1e-12;             % box-activity tolerance for eligibility
+    KA    = zeros(n, K); % maintained K*alpha (= scores), alpha=0 -> 0
+    epsB  = 1e-12; % box-activity tolerance for eligibility
     clk   = clk_new(0);
     hist  = rec_hist(hist, 0, plotted_objective(P, alpha, KA, y));
 
-    chkEvery = max(1, n);              % record / time-check cadence (~1 epoch)
+    chkEvery = max(1, n); % record / time-check cadence (~1 epoch)
     maxSteps = opts.maxIters * max(1, n);
     s = 0;
     while s < maxSteps
