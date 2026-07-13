@@ -121,8 +121,9 @@ function results = run_svm_comparison(matFile, opts)
         datasetName, n, size(X, 2), opts.problem, opts.costMode, opts.C);
 
     ker = make_kernel_op(X, y, P, opts);
-    % P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
-    P.chargedSetup = 0;
+    ker = augment_kernel_bias(ker, y, P, opts);
+    P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
+    % P.chargedSetup = 0;
     fprintf('sigma_1(K) = %.4e (setup %.2f s, charged to the proposed method)\n', ...
         ker.sig1, ker.setupTime);
 
@@ -139,22 +140,35 @@ function results = run_svm_comparison(matFile, opts)
     end
     propLabel = sprintf('PG Dual (%s)', P.name);
 
-    % ---- baseline --------------------------------------------------------
-    if strcmp(P.name, 'mcsvm')
-        baseOut   = baseline_smo_mcsvm(ker, X, y, P, opts);   % SMO family
-        baseLabel = 'CS SMO (max-violating pair, analytic step)';
-    else
-        baseOut = baseline_libsvm_sweep(ker, X, y, P, opts);
-        baseLabel = 'LIBSVM SMO (tol sweep)';
+    % ---- DCD & SMO  -----------------------
+    baseOuts   = {};
+    baseLabels = {};
+
+    switch P.name
+        case 'mcsvm'
+            cand = { baseline_smo_mcsvm(ker, X, y, P, opts),   'CS SMO (max-violating pair)'
+                    baseline_dcd_mcsvm(ker, X, y, P, opts),   'CS sequential dual (Keerthi et al. 2008)' };
+        case 'svr'
+            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'
+                    baseline_dcd_svr(ker, X, y, P, opts),      'Kernel dual CD (SVR)' };
+        case {'l1svm', 'l2svm'}
+            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'
+                    baseline_dcd_binary(ker, X, y, P, opts),   'Kernel dual CD / SOR' };
+        otherwise
+            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
     end
 
-    % ---- figure (the only artifact) --------------------------------------
-    hists = {propOut.hist};
-    labels = {propLabel};
-    if ~baseOut.skipped
-        hists{end+1} = baseOut.hist;
-        labels{end+1} = baseLabel;
+    for c = 1:size(cand, 1)
+        if ~cand{c,1}.skipped
+            baseOuts{end+1}   = cand{c,1};
+            baseLabels{end+1} = cand{c,2};
+        end
     end
+
+    hists  = [{propOut.hist}, cellfun(@(o) o.hist, baseOuts, 'uni', 0)];
+    labels = [{propLabel},    baseLabels];
+
+    % ---- figure (the only artifact) --------------------------------------
     ylab = 'Dual suboptimality  f - f*';
     ttl = sprintf('%s: %s (%s)', datasetName, P.name, opts.costMode);
     if opts.makeFigure
@@ -168,8 +182,8 @@ function results = run_svm_comparison(matFile, opts)
     results.problem = P.name;
     results.costMode = opts.costMode;
     results.proposed = propOut;
-    results.baseline = baseOut;
-    results.labels = {labels};
+    results.baseline = baseOuts;
+    results.labels = labels;
     results.opts = opts;
 end
 
@@ -189,8 +203,11 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'lazyRefresh', 100); % full recompute cadence
                                                   % (guards FP drift)
 
+    opts = set_default(opts, 'biasMode', 'augmented');  % 'constrained' | 'augmented'
+    opts = set_default(opts, 'biasScale', 1); % s in Ktilde = K + s^2
+
     opts = set_default(opts, 'C', 1);
-    opts = set_default(opts, 'nu', 0.2);
+    opts = set_default(opts, 'nu', 0.1);
     opts = set_default(opts, 'epsSVR', 0.1);
     opts = set_default(opts, 'classCosts', []); % per-class multipliers
     opts = set_default(opts, 'costPosFactor', 2); % svr 'cost': over-est box
@@ -199,7 +216,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'binarize', struct('type', 'halfsplit'));
     opts = set_default(opts, 'mcBins', 4);
     opts = set_default(opts, 'maxIters', 5000);
-    opts = set_default(opts, 'tol', 1e-10);
+    opts = set_default(opts, 'tol', 1e-12);
     opts = set_default(opts, 'timeLimit', 60);
     opts = set_default(opts, 'evalEvery', 10);
     opts = set_default(opts, 'printEvery', 200);
@@ -222,6 +239,10 @@ function opts = fill_default_opts(opts)
     valid = {'none', 'cost'};
     if ~any(strcmp(opts.costMode, valid))
         error('opts.costMode must be ''none'' or ''cost''.');
+    end
+    valid = {'constrained', 'augmented'};
+    if ~any(strcmp(opts.biasMode, valid))
+        error('opts.biasMode must be ''constrained'' or ''augmented''.');
     end
 end
 
@@ -429,6 +450,12 @@ function P = make_problem(y, meta, opts)
 
     withCost = strcmp(opts.costMode, 'cost');
 
+    P.hasEq = ~strcmp(opts.biasMode, 'augmented');
+    if any(strcmp(P.name, {'nusvm', 'mcsvm'}))
+        P.hasEq = true; % nusvm: two coupled equalities, no CD reduction.
+                        % mcsvm: per-row equality only; baseline handles it directly.
+    end
+
     switch P.name
         case {'l1svm', 'l2svm'}
             w = class_weights_pm(y, withCost, opts);
@@ -623,7 +650,7 @@ end
 
 
 % ======================================================================
-% Solvers
+% Prox Solvers
 % ======================================================================
 
 %====% L1 & L2 SVM %====%
@@ -679,12 +706,16 @@ function out = solve_l1l2(ker, y, P, opts)
 
         beta = z - grad / L;
         scale = max(1, max(abs(beta)));
-        if isL2
-            h = @(lam) sum(y .* max(beta - lam * y, 0));
+        if P.hasEq
+            if isL2
+                h = @(lam) sum(y .* max(beta - lam * y, 0));
+            else
+                h = @(lam) sum(y .* min(P.Ci, max(beta - lam * y, 0)));
+            end
+            lam = bisect_root(h, scale);
         else
-            h = @(lam) sum(y .* min(P.Ci, max(beta - lam * y, 0)));
+            lam = 0;
         end
-        lam = bisect_root(h, scale);
         if isL2
             alphaNew = max(beta - lam * y, 0);
         else
@@ -702,18 +733,6 @@ function out = solve_l1l2(ker, y, P, opts)
         [theta, tk] = momentum_step(opts, mu, L, tk, (z - alphaNew)' * dA);
         [theta, tk] = momentum_step(opts, mu, L, tk, (z - alphaNew)' * dA);
         z = alphaNew + theta * dA;
-
-        % theta = 0;
-        % if opts.accel
-        %     if (z - alphaNew)' * dA > 0
-        %         tk = 1;
-        %     else
-        %         tk1 = (1 + sqrt(1 + 4 * tk^2)) / 2;
-        %         theta = (tk - 1) / tk1;
-        %         tk = tk1;
-        %     end
-        % end
-        % z = alphaNew + theta * dA;
 
         % Lazy kernel-image maintenance: bound coordinates have dA_i = 0
         % exactly (clip -> clip), so late-phase deltas are supported on
@@ -785,8 +804,12 @@ function out = solve_svr(ker, y, P, opts)
         end
 
         v = z - (gz - y) / L;
-        h = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
-        lam = bisect_root(h, max(1, max(abs(v))));
+        if P.hasEq
+            h = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
+            lam = bisect_root(h, max(1, max(abs(v))));
+        else
+            lam = 0;
+        end
         bNew = min(P.bUp, max(P.bLo, st(v - lam)));
 
         dB = bNew - b;
@@ -1039,6 +1062,10 @@ function out = solve_nusvm(ker, y, P, opts)
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
 
+% ===
+% SMO
+% ===
+
 function out = baseline_libsvm_sweep(ker, X, y, P, opts)
     hist = init_hist();
     out = struct('alpha', [], 'hist', hist, 'skipped', true);
@@ -1250,6 +1277,633 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)
     hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
     out.alpha = alpha;
     out.hist  = hist;
+end
+
+
+% ===
+% Dual Cordinate Descent
+% ===
+function ker = augment_kernel_bias(ker, y, P, opts)
+% Rank-one Gram shift implementing the penalized-bias (equality-free) dual.
+% Active with opts.biasMode = 'augmented'
+%
+% Sets ker.b2 and ker.bv so dcd_kernel_ops() can see the shift, rewrites
+% ker.mul, and recomputes sigma_1 for the shifted operator (solve_l1l2
+% reads ker.sig1 for its step size and MUST see the new value).
+
+    ker.b2 = 0;
+    ker.bv = [];
+    if ~strcmp(opts.biasMode, 'augmented') || strcmp(P.name, 'mcsvm')
+        return;
+    end
+
+    n  = numel(y);
+    s2 = opts.biasScale^2;
+
+    % signed problems store K = (y y') .* Kraw, so the constant-feature
+    % shift lands as s^2 * y y'. Unsigned (svr) gets s^2 * 1 1'.
+    if any(strcmp(P.name, {'l1svm', 'l2svm', 'nusvm'}))
+        v = y(:);
+    else
+        v = ones(n, 1);
+    end
+
+    baseMul  = ker.mul;
+    ker.mul  = @(a) baseMul(a) + s2 * (v * (v' * a));   % rank one; also n x K safe
+    ker.b2   = s2;
+    ker.bv   = v;
+
+    % sigma_1(Ktilde) by power iteration on the shifted operator.
+    tS = tic;
+    u = randn(n, 1);  u = u / norm(u);
+    for k = 1:100
+        u = ker.mul(u);
+        u = u / max(norm(u), 1e-300);
+    end
+    ker.sig1 = max(1.05 * (u' * ker.mul(u)), 1e-12);
+    ker.setupTime = ker.setupTime + toc(tS);
+
+    fprintf(['biasMode = augmented: rank-one shift s^2 = %.4g applied; ', ...
+             'equality constraint dropped, sigma_1(Ktilde) = %.4e\n'], s2, ker.sig1);
+end
+
+function ops = dcd_kernel_ops(ker, X, y, P, opts)
+% Uniform column/diag/mode access for the coordinate methods.
+%
+%   ops.mode   'explicit' -- Gram cached; column lookup is O(n). USE THIS.
+%              'linear'   -- no Gram, but a linear kernel, so maintain
+%                            w = X'(y.*a) and read grad in O(nnz(x_i)).
+%              'blocked'  -- RBF, no Gram. Every coordinate needs a fresh
+%                            kernel column: O(n*d). An epoch is O(n^2 d).
+%                            Unusable as a timing baseline; caller skips.
+%   ops.diag   n x 1 diag of Ktilde
+%   ops.col    @(i) -> Ktilde(:,i), n x 1     (explicit mode only)
+%   ops.b2, ops.bv   rank-one bias shift (0 / [] if none)
+
+    n  = numel(y);
+    b2 = 0;  bv = [];
+    if isfield(ker, 'b2') && ~isempty(ker.b2)
+        b2 = ker.b2;
+        bv = ker.bv;
+    end
+
+    ops = struct('b2', b2, 'bv', bv);
+
+    if ker.explicit
+        ops.mode = 'explicit';
+        ops.diag = full(diag(ker.K));
+        if b2 > 0
+            ops.diag = ops.diag + b2 * (bv .^ 2);
+            ops.col  = @(i) ker.K(:, i) + (b2 * bv(i)) * bv;
+        else
+            ops.col  = @(i) ker.K(:, i);
+        end
+
+    elseif strcmp(opts.kernel, 'linear')
+        ops.mode = 'linear';
+        ops.diag = full(sum(X .^ 2, 2));
+        if b2 > 0
+            ops.diag = ops.diag + b2 * (bv .^ 2);
+        end
+        ops.col = [];
+
+    else
+        ops.mode = 'blocked';
+        ops.diag = ones(n, 1);      % k(x,x) = 1 for RBF
+        ops.col  = [];
+    end
+
+    ops.diag = max(ops.diag, 1e-12);
+end
+
+
+% ======================================================================
+% 1. BINARY: l1svm / l2svm  (+ cost-sensitive)
+%    Kernel SOR / kernel-adatron  (Mangasarian & Musicant 1999)
+%    == Hsieh et al. Alg. 3 (random permutation + shrinking) with a
+%       kernel gradient in place of the w-trick.
+% ======================================================================
+function out = baseline_dcd_binary(ker, X, y, P, opts)
+% Dual (harness convention, MINIMIZED, matches plotted_objective):
+%   l1svm:  f(a) = 0.5 a'Ka - 1'a                      0 <= a_i <= C_i
+%   l2svm:  f(a) = 0.5 a'Ka + 0.5 sum(a^2/C_i) - 1'a   a_i >= 0
+%   K = Ktilde = (y y') .* (Kraw + s^2), no equality constraint.
+%
+% Coordinate i:
+%   G       = g_i - 1                  (l1)      g = K*a maintained
+%           = g_i + a_i/C_i - 1        (l2)
+%   Qbar_ii = K_ii                     (l1)
+%           = K_ii + 1/C_i             (l2)
+%   a_i    <- clip(a_i - G/Qbar_ii, 0, U_i),  U_i = C_i (l1) or Inf (l2)
+%
+% RBF: K_ii = 1 identically, so Qbar_ii = 1 or 1 + 1/C_i. No sigma_1
+% anywhere -- that is the entire point of the comparison.
+
+    hist = init_hist();
+    out  = struct('alpha', [], 'hist', hist, 'skipped', true);
+
+    if ~any(strcmp(P.name, {'l1svm', 'l2svm'}))
+        return;
+    end
+
+    if ~isfield(P, 'hasEq') || P.hasEq
+        warning(['baseline_dcd_binary: dual still carries <alpha,y> = 0; a ', ...
+                 'single-coordinate move is infeasible on it. Set ', ...
+                 'opts.biasMode = ''augmented'' (rank-one Gram shift) to put ', ...
+                 'both solvers on the equality-free dual. Skipping.']);
+        return;
+    end
+
+    ops = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(ops.mode, 'blocked')
+        warning(['baseline_dcd_binary: RBF with no cached Gram. Each coordinate ', ...
+                 'needs a fresh kernel column (O(n*d)), so an epoch is O(n^2 d) ', ...
+                 'and the wall-clock number would be meaningless. Raise ', ...
+                 'opts.explicitKernelMaxN above n = %d. Skipping.'], numel(y));
+        return;
+    end
+
+    n      = numel(y);
+    isL2   = strcmp(P.name, 'l2svm');
+    linear = strcmp(ops.mode, 'linear');
+
+    if isL2
+        U    = inf(n, 1);
+        Qbar = ops.diag + 1 ./ P.Ci;
+    else
+        U    = P.Ci;
+        Qbar = ops.diag;
+    end
+
+    alpha = zeros(n, 1);
+    g     = zeros(n, 1);          % g = Ktilde * alpha   (alpha = 0 -> 0)
+    if linear
+        Xa = X;
+        if ops.b2 > 0
+            Xa = [X, opts.biasScale * ones(n, 1)];   % constant feature == rank-one shift
+        end
+        w = zeros(size(Xa, 2), 1);                   % w = Xa' * (y .* alpha)
+    end
+
+    % ---- shrinking state (Hsieh Alg. 3) -------------------------------
+    A    = (1:n)';
+    Mbar =  inf;
+    mbar = -inf;
+
+    clk  = clk_new(P.chargedSetup);
+    hist = rec_hist(hist, 0, plotted_objective(P, alpha, g, y));
+    chkEvery = max(1, ceil(n / 8));      % sub-epoch recording; epochs are long
+
+    ep    = 0;
+    steps = 0;
+    while ep < opts.maxIters
+        ep = ep + 1;
+
+        M = -inf;
+        m =  inf;
+        A = A(randperm(numel(A)));       % Sec 3.1: random permutation
+        keep = true(numel(A), 1);
+
+        for s = 1:numel(A)
+            i = A(s);
+            steps = steps + 1;
+
+            if linear
+                gi = y(i) * (Xa(i, :) * w);
+            else
+                gi = g(i);
+            end
+
+            if isL2
+                G = gi + alpha(i) / P.Ci(i) - 1;
+            else
+                G = gi - 1;
+            end
+
+            % ---- shrink test + projected gradient ----------------------
+            if alpha(i) <= 0
+                if G > Mbar
+                    keep(s) = false;      % Thm 2.1: stays at 0
+                    continue;
+                end
+                PG = min(G, 0);
+            elseif alpha(i) >= U(i)
+                if G < mbar
+                    keep(s) = false;      % Thm 2.2: stays at U
+                    continue;
+                end
+                PG = max(G, 0);
+            else
+                PG = G;
+            end
+
+            M = max(M, PG);
+            m = min(m, PG);
+
+            % ---- exact 1-D minimizer -----------------------------------
+            if PG ~= 0
+                aOld     = alpha(i);
+                alpha(i) = min(max(aOld - G / Qbar(i), 0), U(i));
+                delta    = alpha(i) - aOld;
+
+                if delta ~= 0
+                    if linear
+                        w = w + (delta * y(i)) * Xa(i, :)';   % O(nnz(x_i))
+                    else
+                        g = g + delta * ops.col(i);           % O(n), cached column
+                    end
+                end
+            end
+
+            % ---- record / time gate ------------------------------------
+            if mod(steps, chkEvery) == 0
+                clk = clk_pause(clk);
+                if linear
+                    g = y .* (Xa * w);      % off-clock, keeps the objective exact
+                end
+                f    = plotted_objective(P, alpha, g, y);
+                hist = rec_hist(hist, clk.solve, f);
+                maybe_print(opts, 'dcd', steps, f);
+                stop = clk.solve >= opts.timeLimit;
+                clk  = clk_resume(clk);
+                if stop
+                    A  = A(keep);
+                    ep = opts.maxIters;
+                    break;
+                end
+            end
+        end
+
+        A = A(keep);
+        if ep >= opts.maxIters
+            break;
+        end
+
+        % ---- stop / un-shrink (Alg. 3 step 3) ---------------------------
+        % The Oct-2020 footnote to Hsieh et al.: M - m <= tol is NOT safe on
+        % its own (at alpha = 0 every grad_i = -1, so M = m = -1 passes a gap
+        % test while being nowhere near optimal). |M| and |m| are checked too.
+        if (M - m <= opts.tol) && (abs(M) <= opts.tol) && (abs(m) <= opts.tol)
+            if numel(A) == n
+                break;
+            end
+            A    = (1:n)';
+            Mbar =  inf;
+            mbar = -inf;
+            continue;
+        end
+
+        if M <= 0, Mbar =  inf; else, Mbar = M; end
+        if m >= 0, mbar = -inf; else, mbar = m; end
+    end
+
+    clk = clk_pause(clk);
+    if linear
+        g = y .* (Xa * w);
+    end
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+
+    out.alpha   = alpha;
+    out.hist    = hist;
+    out.skipped = false;
+end
+
+
+% ======================================================================
+% 2. SVR: eps-insensitive dual CD
+%    (kernel form of Ho & Lin 2012 / LIBLINEAR -s 11-13)
+% ======================================================================
+function out = baseline_dcd_svr(ker, X, y, P, opts)
+% Dual:  f(b) = 0.5 b'Kb - y'b + eps*||b||_1,  bLo_i <= b_i <= bUp_i,
+%        K unsigned, no 1'b = 0.
+%
+% The 1-D subproblem picks up the l1 term:
+%   min_t  0.5*K_ii*t^2 + c*t + eps*|t|,   c = g_i - K_ii*b_i - y_i
+% exact minimizer = soft-threshold, THEN clip:
+%   b_i <- clip( S_{eps/K_ii}( b_i - (g_i - y_i)/K_ii ), bLo_i, bUp_i )
+%
+% Structurally identical to solve_svr's prox step, with the LOCAL curvature
+% K_ii replacing the GLOBAL 1/sigma_1(K). On RBF, K_ii = 1.
+
+    hist = init_hist();
+    out  = struct('alpha', [], 'hist', hist, 'skipped', true);
+
+    if ~strcmp(P.name, 'svr')
+        return;
+    end
+    if ~isfield(P, 'hasEq') || P.hasEq
+        warning(['baseline_dcd_svr: dual still carries 1''beta = 0. Set ', ...
+                 'opts.biasMode = ''augmented'' to compare on the equality-free ', ...
+                 'dual that kernel CD actually solves. Skipping.']);
+        return;
+    end
+
+    ops = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(ops.mode, 'blocked')
+        warning('baseline_dcd_svr: RBF with no cached Gram -> O(n^2 d) per epoch. Skipping.');
+        return;
+    end
+
+    n      = numel(y);
+    epsIns = P.eps;
+    linear = strcmp(ops.mode, 'linear');
+    Kii    = ops.diag;
+
+    b = zeros(n, 1);
+    g = zeros(n, 1);                       % g = Ktilde * b
+    if linear
+        Xa = X;
+        if ops.b2 > 0
+            Xa = [X, opts.biasScale * ones(n, 1)];
+        end
+        w = zeros(size(Xa, 2), 1);         % w = Xa' * b
+    end
+
+    A    = (1:n)';
+    Mbar =  inf;
+    mbar = -inf;
+
+    clk  = clk_new(P.chargedSetup);
+    hist = rec_hist(hist, 0, plotted_objective(P, b, g, y));
+    chkEvery = max(1, ceil(n / 8));
+
+    ep    = 0;
+    steps = 0;
+    while ep < opts.maxIters
+        ep = ep + 1;
+
+        M = -inf;
+        m =  inf;
+        A = A(randperm(numel(A)));
+        keep = true(numel(A), 1);
+
+        for s = 1:numel(A)
+            i = A(s);
+            steps = steps + 1;
+
+            if linear
+                gi = Xa(i, :) * w;
+            else
+                gi = g(i);
+            end
+
+            G  = gi - y(i);        % smooth part of the gradient
+            bi = b(i);
+
+            % ---- projected gradient of the NONSMOOTH objective -----------
+            % eps*|b_i| makes the subdifferential at b_i = 0 the interval
+            % [G-eps, G+eps]; b_i = 0 is optimal iff |G| <= eps.
+            if bi >= P.bUp(i)
+                PG = max(G + epsIns, 0);
+                if G + epsIns < mbar, keep(s) = false; continue; end
+            elseif bi <= P.bLo(i)
+                PG = min(G - epsIns, 0);
+                if G - epsIns > Mbar, keep(s) = false; continue; end
+            elseif bi > 0
+                PG = G + epsIns;
+            elseif bi < 0
+                PG = G - epsIns;
+            else
+                PG = min(G + epsIns, 0) + max(G - epsIns, 0);   % 0 iff |G| <= eps
+            end
+
+            M = max(M, PG);
+            m = min(m, PG);
+
+            if PG ~= 0
+                u     = bi - G / Kii(i);
+                thr   = epsIns / Kii(i);
+                bNew  = sign(u) * max(abs(u) - thr, 0);              % S_{eps/K_ii}
+                bNew  = min(P.bUp(i), max(P.bLo(i), bNew));          % clip
+                delta = bNew - bi;
+
+                if delta ~= 0
+                    b(i) = bNew;
+                    if linear
+                        w = w + delta * Xa(i, :)';
+                    else
+                        g = g + delta * ops.col(i);
+                    end
+                end
+            end
+
+            if mod(steps, chkEvery) == 0
+                clk = clk_pause(clk);
+                if linear
+                    g = Xa * w;
+                end
+                f    = plotted_objective(P, b, g, y);
+                hist = rec_hist(hist, clk.solve, f);
+                maybe_print(opts, 'dcd-svr', steps, f);
+                stop = clk.solve >= opts.timeLimit;
+                clk  = clk_resume(clk);
+                if stop
+                    A  = A(keep);
+                    ep = opts.maxIters;
+                    break;
+                end
+            end
+        end
+
+        A = A(keep);
+        if ep >= opts.maxIters
+            break;
+        end
+
+        if (M - m <= opts.tol) && (abs(M) <= opts.tol) && (abs(m) <= opts.tol)
+            if numel(A) == n
+                break;
+            end
+            A    = (1:n)';
+            Mbar =  inf;
+            mbar = -inf;
+            continue;
+        end
+
+        if M <= 0, Mbar =  inf; else, Mbar = M; end
+        if m >= 0, mbar = -inf; else, mbar = m; end
+    end
+
+    clk = clk_pause(clk);
+    if linear
+        g = Xa * w;
+    end
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y));
+
+    out.alpha   = b;
+    out.hist    = hist;
+    out.skipped = false;
+end
+
+
+% ======================================================================
+% 3. MULTICLASS: Crammer-Singer sequential dual (Keerthi et al. 2008)
+%    NO PATCH NEEDED -- runs against the harness as it stands.
+% ======================================================================
+function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
+% CS has no bias term, and its equality sum_j a_ij = 0 is per-ROW, so exact
+% block-coordinate descent over rows is feasible with no reformulation.
+%
+% Dual (identical to solve_mcsvm and baseline_smo_mcsvm):
+%   min  0.5*trace(a'Ka) - <a, E>
+%   s.t. 0 <= a_{i,y_i} <= C_i,  -C_i <= a_{i,j} <= 0 (j != y_i),  a_i 1 = 0
+%
+% Block minimizer for row i, with g_i = (K a)_{i,:}:
+%   a_i <- Proj_{Omega_i}( a_i - (g_i - E_i) / K_ii )
+%
+% versus solve_mcsvm's Jacobi step:
+%   a_i <- Proj_{Omega_i}( a_i - (g_i - E_i) / sigma_1(K) )
+%
+% SAME PROJECTION. SAME BISECTION. The only difference is local curvature
+% K_ii vs the global Lipschitz constant sigma_1(K) -- plus Gauss-Seidel
+% (row i sees rows 1..i-1 from this epoch) instead of Jacobi.
+%
+% On RBF this gap is at its widest: K_ii = 1 exactly, while sigma_1(K) for
+% an RBF Gram grows with n. Figures 3(d)-(g) currently have no coordinate
+% baseline at all -- only FW variants and your own PG family, every one of
+% which carries the 1/sigma_1(K) step. This is the referee's first question.
+%
+% Cost accounting: one row update is O(n*K) with a cached Gram column, so an
+% epoch is O(n^2*K) -- the same as ONE of your PG matvecs. Cost-matched.
+
+    hist = init_hist();
+    out  = struct('alpha', [], 'hist', hist, 'skipped', true);
+
+    if ~strcmp(P.name, 'mcsvm')
+        return;
+    end
+
+    ops = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(ops.mode, 'blocked')
+        warning(['baseline_dcd_mcsvm: RBF with no cached Gram -> a kernel column ', ...
+                 'per ROW. Raise opts.explicitKernelMaxN above n = %d. Skipping.'], ...
+                 numel(y));
+        return;
+    end
+
+    n = numel(y);
+    K = P.K;
+
+    E   = full(sparse((1:n)', y, 1, n, K));    % 1_ind
+    CiK = repmat(P.Ci, 1, K);
+    UP  = E .* CiK;                             % [0, C_i] at the true class
+    LO  = (E - 1) .* CiK;                       % [-C_i, 0] elsewhere
+
+    linear = strcmp(ops.mode, 'linear');
+    Kii    = ops.diag;
+
+    alpha = zeros(n, K);
+    KA    = zeros(n, K);                        % maintained K*alpha
+    if linear
+        W = zeros(size(X, 2), K);               % W = X'*alpha  (d x K)
+    end
+
+    A = (1:n)';                                 % active rows
+
+    clk  = clk_new(P.chargedSetup);
+    hist = rec_hist(hist, 0, plotted_objective(P, alpha, KA, y));
+    chkEvery = max(1, ceil(n / 8));
+
+    ep    = 0;
+    steps = 0;
+    while ep < opts.maxIters
+        ep = ep + 1;
+
+        maxViol = 0;
+        A = A(randperm(numel(A)));
+        keep = true(numel(A), 1);
+
+        for s = 1:numel(A)
+            i = A(s);
+            steps = steps + 1;
+
+            if linear
+                gi = X(i, :) * W;               % 1 x K
+            else
+                gi = KA(i, :);
+            end
+
+            % exact block minimizer: capped-simplex projection, step 1/K_ii
+            B    = alpha(i, :) - (gi - E(i, :)) / Kii(i);
+            aNew = cs_row_project(B, LO(i, :), UP(i, :), P.Ci(i));
+
+            dRow = aNew - alpha(i, :);
+            viol = max(abs(dRow));
+
+            % The projection IS the exact row minimizer, so ||dRow||_inf = 0
+            % certifies row i optimal given the rest. Shrink on exactly that.
+            if viol <= opts.tol
+                keep(s) = false;
+            else
+                maxViol      = max(maxViol, viol);
+                alpha(i, :)  = aNew;
+                if linear
+                    W = W + X(i, :)' * dRow;              % O(nnz(x_i)*K)
+                else
+                    KA = KA + ops.col(i) * dRow;          % O(n*K)
+                end
+            end
+
+            if mod(steps, chkEvery) == 0
+                clk = clk_pause(clk);
+                if linear
+                    KA = X * W;
+                end
+                f    = plotted_objective(P, alpha, KA, y);
+                hist = rec_hist(hist, clk.solve, f);
+                maybe_print(opts, 'dcd-cs', steps, f);
+                stop = clk.solve >= opts.timeLimit;
+                clk  = clk_resume(clk);
+                if stop
+                    A  = A(keep);
+                    ep = opts.maxIters;
+                    break;
+                end
+            end
+        end
+
+        A = A(keep);
+        if ep >= opts.maxIters
+            break;
+        end
+
+        if maxViol <= opts.tol
+            if numel(A) == n
+                break;                       % optimal over all rows
+            end
+            A = (1:n)';                      % reactivate and re-verify
+            continue;
+        end
+    end
+
+    clk = clk_pause(clk);
+    if linear
+        KA = X * W;
+    end
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
+
+    out.alpha   = alpha;
+    out.hist    = hist;
+    out.skipped = false;
+end
+
+
+function a = cs_row_project(B, lo, up, Ci)
+% Project one row onto {lo <= a <= up, sum(a) = 0}.
+% a = clip(B - lam, lo, up), with h(lam) = sum(clip(B - lam, lo, up)) = 0.
+% h is nonincreasing in lam -> bisect. Scalar twin of the vectorized
+% 80-iteration loop already inside solve_mcsvm: same root, same answer.
+    l = min(B) - Ci - 1;      % h(l) >= 0
+    h = max(B) + 1;           % h(h) <= 0
+    for k = 1:60
+        mid = 0.5 * (l + h);
+        if sum(min(up, max(lo, B - mid))) > 0
+            l = mid;
+        else
+            h = mid;
+        end
+    end
+    a = min(up, max(lo, B - 0.5 * (l + h)));
 end
 
 % ===
