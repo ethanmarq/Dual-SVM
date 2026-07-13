@@ -121,6 +121,15 @@ function results = run_svm_comparison(matFile, opts)
         datasetName, n, size(X, 2), opts.problem, opts.costMode, opts.C);
 
     ker = make_kernel_op(X, y, P, opts);
+    if ker.explicit
+        maxKii = max(full(diag(ker.K)));
+    elseif strcmp(opts.kernel, 'linear')
+        maxKii = max(full(sum(X .^ 2, 2)));
+    else
+        maxKii = 1;                      % RBF: k(x,x) = exp(0) = 1
+    end
+    fprintf('sigma_1(K) = %.4e | max_i K_ii = %.4e | ratio = %.2f\n', ...
+            ker.sig1 / 1.05, maxKii, (ker.sig1 / 1.05) / maxKii);
     ker = augment_kernel_bias(ker, y, P, opts);
     P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
     % P.chargedSetup = 0;
@@ -203,7 +212,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'lazyRefresh', 100); % full recompute cadence
                                                   % (guards FP drift)
 
-    opts = set_default(opts, 'biasMode', 'augmented');  % 'constrained' | 'augmented'
+    opts = set_default(opts, 'biasMode', 'none');  % 'constrained' | 'augmented'
     opts = set_default(opts, 'biasScale', 1); % s in Ktilde = K + s^2
 
     opts = set_default(opts, 'C', 1);
@@ -240,7 +249,7 @@ function opts = fill_default_opts(opts)
     if ~any(strcmp(opts.costMode, valid))
         error('opts.costMode must be ''none'' or ''cost''.');
     end
-    valid = {'constrained', 'augmented'};
+    valid = {'constrained', 'augmented', 'none'};
     if ~any(strcmp(opts.biasMode, valid))
         error('opts.biasMode must be ''constrained'' or ''augmented''.');
     end
@@ -1293,7 +1302,8 @@ function ker = augment_kernel_bias(ker, y, P, opts)
 
     ker.b2 = 0;
     ker.bv = [];
-    if ~strcmp(opts.biasMode, 'augmented') || strcmp(P.name, 'mcsvm')
+    metho = {'augmented', 'none'};
+    if ~any(strcmp(opts.biasMode, metho)) || strcmp(P.name, 'mcsvm')
         return;
     end
 
@@ -1325,6 +1335,19 @@ function ker = augment_kernel_bias(ker, y, P, opts)
 
     fprintf(['biasMode = augmented: rank-one shift s^2 = %.4g applied; ', ...
              'equality constraint dropped, sigma_1(Ktilde) = %.4e\n'], s2, ker.sig1);
+
+    opts = set_default(opts, 'biasMode', 'constrained');  % 'constrained' | 'none' | 'augmented'
+
+    valid = {'constrained', 'none', 'augmented'};
+    if ~any(strcmp(opts.biasMode, valid))
+        error('opts.biasMode must be ''constrained'', ''none'', or ''augmented''.');
+    end
+    if strcmp(opts.biasMode, 'none')
+        opts.biasScale = 0;              % zero shift == bias-free dual
+    end
+
+    % make_problem
+    P.hasEq = strcmp(opts.biasMode, 'constrained');
 end
 
 function ops = dcd_kernel_ops(ker, X, y, P, opts)
@@ -1399,7 +1422,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
 % RBF: K_ii = 1 identically, so Qbar_ii = 1 or 1 + 1/C_i. No sigma_1
 % anywhere -- that is the entire point of the comparison.
 
-    hist = init_hist();
+    hist = H.init_hist();
     out  = struct('alpha', [], 'hist', hist, 'skipped', true);
 
     if ~any(strcmp(P.name, {'l1svm', 'l2svm'}))
@@ -1414,8 +1437,8 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
         return;
     end
 
-    ops = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(ops.mode, 'blocked')
+    kacc = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(kacc.mode, 'blocked')
         warning(['baseline_dcd_binary: RBF with no cached Gram. Each coordinate ', ...
                  'needs a fresh kernel column (O(n*d)), so an epoch is O(n^2 d) ', ...
                  'and the wall-clock number would be meaningless. Raise ', ...
@@ -1425,21 +1448,21 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
 
     n      = numel(y);
     isL2   = strcmp(P.name, 'l2svm');
-    linear = strcmp(ops.mode, 'linear');
+    linear = strcmp(kacc.mode, 'linear');
 
     if isL2
         U    = inf(n, 1);
-        Qbar = ops.diag + 1 ./ P.Ci;
+        Qbar = kacc.diag + 1 ./ P.Ci;
     else
         U    = P.Ci;
-        Qbar = ops.diag;
+        Qbar = kacc.diag;
     end
 
     alpha = zeros(n, 1);
     g     = zeros(n, 1);          % g = Ktilde * alpha   (alpha = 0 -> 0)
     if linear
         Xa = X;
-        if ops.b2 > 0
+        if kacc.b2 > 0
             Xa = [X, opts.biasScale * ones(n, 1)];   % constant feature == rank-one shift
         end
         w = zeros(size(Xa, 2), 1);                   % w = Xa' * (y .* alpha)
@@ -1450,12 +1473,13 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
     Mbar =  inf;
     mbar = -inf;
 
-    clk  = clk_new(P.chargedSetup);
-    hist = rec_hist(hist, 0, plotted_objective(P, alpha, g, y));
+    clk  = H.clk_new(P.chargedSetup);
+    hist = H.rec_hist(hist, 0, H.obj(P, alpha, g, y));
     chkEvery = max(1, ceil(n / 8));      % sub-epoch recording; epochs are long
 
-    ep    = 0;
-    steps = 0;
+    ep     = 0;
+    steps  = 0;
+    timeUp = false;
     while ep < opts.maxIters
         ep = ep + 1;
 
@@ -1510,32 +1534,30 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
                     if linear
                         w = w + (delta * y(i)) * Xa(i, :)';   % O(nnz(x_i))
                     else
-                        g = g + delta * ops.col(i);           % O(n), cached column
+                        g = g + delta * kacc.col(i);           % O(n), cached column
                     end
                 end
             end
 
             % ---- record / time gate ------------------------------------
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
+                clk = H.clk_pause(clk);
                 if linear
                     g = y .* (Xa * w);      % off-clock, keeps the objective exact
                 end
-                f    = plotted_objective(P, alpha, g, y);
-                hist = rec_hist(hist, clk.solve, f);
-                maybe_print(opts, 'dcd', steps, f);
-                stop = clk.solve >= opts.timeLimit;
-                clk  = clk_resume(clk);
-                if stop
-                    A  = A(keep);
-                    ep = opts.maxIters;
-                    break;
+                f    = H.obj(P, alpha, g, y);
+                hist = H.rec_hist(hist, clk.solve, f);
+                H.maybe_print(opts, 'dcd', steps, f);
+                timeUp = clk.solve >= opts.timeLimit;
+                clk    = H.clk_resume(clk);
+                if timeUp
+                    break;   % the single A = A(keep) after the loop handles it
                 end
             end
         end
 
-        A = A(keep);
-        if ep >= opts.maxIters
+        A = A(keep);            % applied EXACTLY once per epoch
+        if timeUp
             break;
         end
 
@@ -1557,17 +1579,16 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
         if m >= 0, mbar = -inf; else, mbar = m; end
     end
 
-    clk = clk_pause(clk);
+    clk = H.clk_pause(clk);
     if linear
         g = y .* (Xa * w);
     end
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+    hist = H.rec_hist(hist, clk.solve, H.obj(P, alpha, g, y));
 
     out.alpha   = alpha;
     out.hist    = hist;
     out.skipped = false;
 end
-
 
 % ======================================================================
 % 2. SVR: eps-insensitive dual CD
@@ -1585,7 +1606,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
 % Structurally identical to solve_svr's prox step, with the LOCAL curvature
 % K_ii replacing the GLOBAL 1/sigma_1(K). On RBF, K_ii = 1.
 
-    hist = init_hist();
+    hist = H.init_hist();
     out  = struct('alpha', [], 'hist', hist, 'skipped', true);
 
     if ~strcmp(P.name, 'svr')
@@ -1598,22 +1619,22 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
         return;
     end
 
-    ops = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(ops.mode, 'blocked')
+    kacc = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(kacc.mode, 'blocked')
         warning('baseline_dcd_svr: RBF with no cached Gram -> O(n^2 d) per epoch. Skipping.');
         return;
     end
 
     n      = numel(y);
     epsIns = P.eps;
-    linear = strcmp(ops.mode, 'linear');
-    Kii    = ops.diag;
+    linear = strcmp(kacc.mode, 'linear');
+    Kii    = kacc.diag;
 
     b = zeros(n, 1);
     g = zeros(n, 1);                       % g = Ktilde * b
     if linear
         Xa = X;
-        if ops.b2 > 0
+        if kacc.b2 > 0
             Xa = [X, opts.biasScale * ones(n, 1)];
         end
         w = zeros(size(Xa, 2), 1);         % w = Xa' * b
@@ -1623,12 +1644,13 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
     Mbar =  inf;
     mbar = -inf;
 
-    clk  = clk_new(P.chargedSetup);
-    hist = rec_hist(hist, 0, plotted_objective(P, b, g, y));
+    clk  = H.clk_new(P.chargedSetup);
+    hist = H.rec_hist(hist, 0, H.obj(P, b, g, y));
     chkEvery = max(1, ceil(n / 8));
 
-    ep    = 0;
-    steps = 0;
+    ep     = 0;
+    steps  = 0;
+    timeUp = false;
     while ep < opts.maxIters
         ep = ep + 1;
 
@@ -1682,31 +1704,29 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
                     if linear
                         w = w + delta * Xa(i, :)';
                     else
-                        g = g + delta * ops.col(i);
+                        g = g + delta * kacc.col(i);
                     end
                 end
             end
 
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
+                clk = H.clk_pause(clk);
                 if linear
                     g = Xa * w;
                 end
-                f    = plotted_objective(P, b, g, y);
-                hist = rec_hist(hist, clk.solve, f);
-                maybe_print(opts, 'dcd-svr', steps, f);
-                stop = clk.solve >= opts.timeLimit;
-                clk  = clk_resume(clk);
-                if stop
-                    A  = A(keep);
-                    ep = opts.maxIters;
-                    break;
+                f    = H.obj(P, b, g, y);
+                hist = H.rec_hist(hist, clk.solve, f);
+                H.maybe_print(opts, 'dcd-svr', steps, f);
+                timeUp = clk.solve >= opts.timeLimit;
+                clk    = H.clk_resume(clk);
+                if timeUp
+                    break;   % the single A = A(keep) after the loop handles it
                 end
             end
         end
 
-        A = A(keep);
-        if ep >= opts.maxIters
+        A = A(keep);            % applied EXACTLY once per epoch
+        if timeUp
             break;
         end
 
@@ -1724,11 +1744,11 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
         if m >= 0, mbar = -inf; else, mbar = m; end
     end
 
-    clk = clk_pause(clk);
+    clk = H.clk_pause(clk);
     if linear
         g = Xa * w;
     end
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y));
+    hist = H.rec_hist(hist, clk.solve, H.obj(P, b, g, y));
 
     out.alpha   = b;
     out.hist    = hist;
@@ -1766,15 +1786,15 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
 % Cost accounting: one row update is O(n*K) with a cached Gram column, so an
 % epoch is O(n^2*K) -- the same as ONE of your PG matvecs. Cost-matched.
 
-    hist = init_hist();
+    hist = H.init_hist();
     out  = struct('alpha', [], 'hist', hist, 'skipped', true);
 
     if ~strcmp(P.name, 'mcsvm')
         return;
     end
 
-    ops = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(ops.mode, 'blocked')
+    kacc = dcd_kernel_ops(ker, X, y, P, opts);
+    if strcmp(kacc.mode, 'blocked')
         warning(['baseline_dcd_mcsvm: RBF with no cached Gram -> a kernel column ', ...
                  'per ROW. Raise opts.explicitKernelMaxN above n = %d. Skipping.'], ...
                  numel(y));
@@ -1789,8 +1809,8 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
     UP  = E .* CiK;                             % [0, C_i] at the true class
     LO  = (E - 1) .* CiK;                       % [-C_i, 0] elsewhere
 
-    linear = strcmp(ops.mode, 'linear');
-    Kii    = ops.diag;
+    linear = strcmp(kacc.mode, 'linear');
+    Kii    = kacc.diag;
 
     alpha = zeros(n, K);
     KA    = zeros(n, K);                        % maintained K*alpha
@@ -1800,12 +1820,13 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
 
     A = (1:n)';                                 % active rows
 
-    clk  = clk_new(P.chargedSetup);
-    hist = rec_hist(hist, 0, plotted_objective(P, alpha, KA, y));
+    clk  = H.clk_new(P.chargedSetup);
+    hist = H.rec_hist(hist, 0, H.obj(P, alpha, KA, y));
     chkEvery = max(1, ceil(n / 8));
 
-    ep    = 0;
-    steps = 0;
+    ep     = 0;
+    steps  = 0;
+    timeUp = false;
     while ep < opts.maxIters
         ep = ep + 1;
 
@@ -1840,30 +1861,28 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
                 if linear
                     W = W + X(i, :)' * dRow;              % O(nnz(x_i)*K)
                 else
-                    KA = KA + ops.col(i) * dRow;          % O(n*K)
+                    KA = KA + kacc.col(i) * dRow;          % O(n*K)
                 end
             end
 
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
+                clk = H.clk_pause(clk);
                 if linear
                     KA = X * W;
                 end
-                f    = plotted_objective(P, alpha, KA, y);
-                hist = rec_hist(hist, clk.solve, f);
-                maybe_print(opts, 'dcd-cs', steps, f);
-                stop = clk.solve >= opts.timeLimit;
-                clk  = clk_resume(clk);
-                if stop
-                    A  = A(keep);
-                    ep = opts.maxIters;
-                    break;
+                f    = H.obj(P, alpha, KA, y);
+                hist = H.rec_hist(hist, clk.solve, f);
+                H.maybe_print(opts, 'dcd-cs', steps, f);
+                timeUp = clk.solve >= opts.timeLimit;
+                clk    = H.clk_resume(clk);
+                if timeUp
+                    break;   % the single A = A(keep) after the loop handles it
                 end
             end
         end
 
-        A = A(keep);
-        if ep >= opts.maxIters
+        A = A(keep);            % applied EXACTLY once per epoch
+        if timeUp
             break;
         end
 
@@ -1876,11 +1895,11 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
         end
     end
 
-    clk = clk_pause(clk);
+    clk = H.clk_pause(clk);
     if linear
         KA = X * W;
     end
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
+    hist = H.rec_hist(hist, clk.solve, H.obj(P, alpha, KA, y));
 
     out.alpha   = alpha;
     out.hist    = hist;
