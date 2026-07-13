@@ -11,5 +11,4 @@ run_svm_comparison(data, struct('problem', 'nusvm','overwrite', true))
 run_svm_comparison(data, struct('problem', 'svr','overwrite', true))
 
 
-
 data="/scratch/marque6/libsvm_data/rcv1_train.mat";
