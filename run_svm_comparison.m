@@ -133,8 +133,8 @@ function results = run_svm_comparison(matFile, opts)
     ker = augment_kernel_bias(ker, y, P, opts);
     P.setupGram = ker.gramTime;                        % everyone touching ker.K
     P.setupPG   = ker.gramTime + ker.sig1Time;         % PG additionally needs sigma_1
-    fprintf('sigma_1(K) = %.4e (setup %.2f s, charged to the proposed method)\n', ...
-        ker.sig1, ker.setupTime);
+    fprintf('Gram Setup Cost %.2f, Sigma_1 setup cost: %.2f\n', ...
+        P.setupGram, P.setupPG);
 
     % ---- proposed method -------------------------------------------------
     switch P.name
