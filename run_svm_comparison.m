@@ -131,8 +131,8 @@ function results = run_svm_comparison(matFile, opts)
     fprintf('sigma_1(K) = %.4e | max_i K_ii = %.4e | ratio = %.2f\n', ...
             ker.sig1 / 1.05, maxKii, (ker.sig1 / 1.05) / maxKii);
     ker = augment_kernel_bias(ker, y, P, opts);
-    P.chargedSetup = ker.setupTime;   % sigma_1 / K build time billed to us
-    % P.chargedSetup = 0;
+    P.setupGram = ker.gramTime;                        % everyone touching ker.K
+    P.setupPG   = ker.gramTime + ker.sig1Time;         % PG additionally needs sigma_1
     fprintf('sigma_1(K) = %.4e (setup %.2f s, charged to the proposed method)\n', ...
         ker.sig1, ker.setupTime);
 
@@ -458,7 +458,8 @@ function P = make_problem(y, meta, opts)
     P.nu = opts.nu;
     P.eps = opts.epsSVR;
     P.K = meta.K;
-    P.chargedSetup = 0;
+    P.setupPG = 0;
+    P.setupGram = 0;
 
     withCost = strcmp(opts.costMode, 'cost');
 
@@ -534,7 +535,8 @@ function ker = make_kernel_op(X, y, P, opts)
     n = size(X, 1);
     signed = any(strcmp(P.name, {'l1svm', 'l2svm', 'nusvm'}));
     isRbf = strcmp(opts.kernel, 'rbf');
-    tSetup = tic;
+
+    tG = tic; % Grams starts
 
     if n <= opts.explicitKernelMaxN
         if isRbf
@@ -567,6 +569,10 @@ function ker = make_kernel_op(X, y, P, opts)
         ker.explicit = false;
     end
 
+    ker.gramTime = toc(tG); % Gram ends
+
+    tS = tic; % sigma_1 starts
+
     if isRbf
         v = randn(n, 1);
         v = v / norm(v);
@@ -589,7 +595,9 @@ function ker = make_kernel_op(X, y, P, opts)
         end
     end
     ker.sig1 = max(ker.sig1, 1e-12);
-    ker.setupTime = toc(tSetup);
+
+    ker.sig1Time = toc(tS);
+    ker.setupTime = ker.gramTime + ker.sig1Time;
 end
 
 
@@ -693,7 +701,7 @@ function out = solve_l1l2(ker, y, P, opts)
     gz = zeros(n, 1); % maintained K*z
     sinceRefresh = 0;
     hist = init_hist();
-    clk = clk_new(P.chargedSetup);
+    clk = clk_new(P.setupPG);
 
     it = 0;
     while it < opts.maxIters
@@ -798,7 +806,7 @@ function out = solve_svr(ker, y, P, opts)
     gz = zeros(n, 1); % maintained K*z
     sinceRefresh = 0;
     hist = init_hist();
-    clk = clk_new(P.chargedSetup);
+    clk = clk_new(P.setupPG);
 
     it = 0;
     while it < opts.maxIters
@@ -891,7 +899,7 @@ function out = solve_mcsvm(ker, y, P, opts)
     GZ = zeros(n, K); % maintained K*Z
     sinceRefresh = 0;
     hist = init_hist();
-    clk = clk_new(P.chargedSetup);
+    clk = clk_new(P.setupPG);
 
     it = 0;
     while it < opts.maxIters
@@ -998,7 +1006,7 @@ function out = solve_nusvm(ker, y, P, opts)
     gz = zeros(n, 1); % maintained K*z
     sinceRefresh = 0;
     hist = init_hist();
-    clk = clk_new(P.chargedSetup);
+    clk = clk_new(P.setupPG);
 
     it = 0;
     while it < opts.maxIters
@@ -1473,7 +1481,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
     Mbar =  inf;
     mbar = -inf;
 
-    clk  = clk_new(P.chargedSetup);
+    clk  = clk_new(P.setupGram);
     hist = rec_hist(hist, 0, plotted_objective(P, alpha, g, y));
     chkEvery = max(1, ceil(n / 8));      % sub-epoch recording; epochs are long
 
@@ -1644,7 +1652,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
     Mbar =  inf;
     mbar = -inf;
 
-    clk  = clk_new(P.chargedSetup);
+    clk  = clk_new(P.setupGram);
     hist = rec_hist(hist, 0, plotted_objective(P, b, g, y));
     chkEvery = max(1, ceil(n / 8));
 
@@ -1820,7 +1828,7 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
 
     A = (1:n)';                                 % active rows
 
-    clk  = clk_new(P.chargedSetup);
+    clk  = clk_new(P.setupGram);
     hist = rec_hist(hist, 0, plotted_objective(P, alpha, KA, y));
     chkEvery = max(1, ceil(n / 8));
 
