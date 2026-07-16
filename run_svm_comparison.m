@@ -73,6 +73,14 @@ function results = run_svm_comparison(matFile, opts)
     addpath('./libsvm-336/matlab');
     addpath('./liblinear-249/matlab');
 
+    matFile = '/scratch/marque6/libsvm_data/rcv1_binary.mat';
+    if nargin >= 2 && isfield(opts, 'cvGamma')
+        results = cv_gamma_sweep(matFile, opts);
+        return;
+    end
+
+
+
     if nargin < 2
         opts = struct();
     end
@@ -111,6 +119,8 @@ function results = run_svm_comparison(matFile, opts)
     P.setupPG   = ker.gramTime + ker.sig1Time;    % PG also pays for sigma_1
     fprintf('setup: Gram %.2f s (shared) + sigma_1 %.2f s (PG only)\n', ...
             ker.gramTime, ker.sig1Time);
+
+
 
     % ---- proposed solver -------------------------------------------------
     switch P.name
@@ -209,7 +219,7 @@ function opts = fill_default_opts(opts)
 %FILL_DEFAULT_OPTS  Populate unset fields and validate.
 
     % problem
-    opts = set_default(opts, 'problem',  'nusvm');   % l1svm l2svm svr nusvm mcsvm
+    opts = set_default(opts, 'problem',  'l2svm');   % l1svm l2svm svr nusvm mcsvm
     opts = set_default(opts, 'costMode', 'none');
     opts = set_default(opts, 'C',        1);
     opts = set_default(opts, 'nu',       0.1);
@@ -217,7 +227,7 @@ function opts = fill_default_opts(opts)
 
     % kernel
     opts = set_default(opts, 'kernel',   'rbf');     % 'linear' | 'rbf'
-    opts = set_default(opts, 'rbfGamma', 0.5);       % k = exp(-g||x - x'||^2),
+    opts = set_default(opts, 'rbfGamma', 3);       % k = exp(-g||x - x'||^2),
                                                      % g = 1/(2r^2), radius 1
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
 
@@ -228,7 +238,7 @@ function opts = fill_default_opts(opts)
     % proximal solver
     opts = set_default(opts, 'accel',       true);
     opts = set_default(opts, 'lazy',        true);   % incremental K*delta updates
-    opts = set_default(opts, 'lazyRefresh', 10);    % full recompute cadence (FP drift)
+    opts = set_default(opts, 'lazyRefresh', 100);    % full recompute cadence (FP drift)
     opts = set_default(opts, 'maxIters',    5000);
     opts = set_default(opts, 'tol',         1e-12);
     opts = set_default(opts, 'timeLimit',   60);
@@ -679,15 +689,19 @@ function ker = make_kernel_op(X, y, P, opts)
     % ---- sigma_1 ---------------------------------------------------------
     tSig1 = tic;
 
-    % Every PG solver uses adaptive backtracking, so we just need a
-    % reasonable lower bound to start the local Lipschitz estimate.
-    if ker.explicit
-        ker.sig1 = max(full(diag(ker.K)));
-    else
-        ker.sig1 = 1;
-    end
+    % % Every PG solver uses adaptive backtracking, so we just need a
+    % % reasonable lower bound to start the local Lipschitz estimate.
+    % if ker.explicit
+    %     ker.sig1 = max(full(diag(ker.K)));
+    % else
+    %     ker.sig1 = 1;
+    % end
 
-    ker.sig1Time  = toc(tSig1);
+    % ker.sig1Time  = toc(tSig1);
+    optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
+    s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
+    ker.sig1     = 1.05 * abs(s1);
+    ker.sig1Time = toc(tSig1);
     ker.setupTime = ker.gramTime + ker.sig1Time;
 end
 
@@ -801,15 +815,14 @@ function ker = augment_kernel_bias(ker, y, P, opts)
     ker.bv  = v;
 
     tSig1 = tic;
-    u = randn(n, 1);
-    u = u / norm(u);
-    for k = 1:100
-        u = ker.mul(u);
-        u = u / max(norm(u), 1e-300);
-    end
-    ker.sig1      = max(1.05 * (u' * ker.mul(u)), 1e-12);
-    ker.sig1Time  = ker.sig1Time + toc(tSig1);
-    ker.setupTime = ker.gramTime + ker.sig1Time;
+    % ker.sig1     = max(full(diag(ker.K))) + s2;   % RBF: K_ii=1, v_i^2=1
+    % ker.sig1Time = ker.sig1Time + 0;
+    % tSig1 = tic;
+    optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
+    s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
+    ker.sig1     = 1.05 * abs(s1);          % keep the safety factor (see below)
+    ker.sig1Time = toc(tSig1);
+        ker.setupTime = ker.gramTime + ker.sig1Time;
 
     fprintf(['biasMode = augmented: rank-one shift s^2 = %.4g applied; ', ...
              'equality dropped, sigma_1(Ktilde) = %.4e\n'], s2, ker.sig1);
@@ -1071,15 +1084,10 @@ function out = solve_svr(ker, y, P, opts)
 %       lambda <- root of  sum_i clip(S(v_i - lambda)) = 0     (bisection)
 %       b      <- clip(S(v - lambda))
 
-    n = numel(y);
-
-    if ker.explicit
-        L = max(full(diag(ker.K)));
-    else
-        L = 1;  % RBF k(x,x)=1, or a safe generic lower bound
-    end
-    eta    = 2;     % backtracking growth
-    shrink = 0.98;  % let L drift back down on the active manifold
+    n   = numel(y);
+    L   = ker.sig1;
+    thr = P.eps / L;
+    st  = @(u) sign(u) .* max(abs(u) - thr, 0);   % S_{eps/L}
 
     b            = zeros(n, 1);
     z            = b;
@@ -1107,52 +1115,22 @@ function out = solve_svr(ker, y, P, opts)
             break;
         end
 
-        % --- Objective and Gradient at z ---
-        fz    = plotted_objective(P, z, gz, y);
-        gradZ = gz - y;
+        v = z - (gz - y) / L;
 
-        % --- Backtracking Line Search ---
-        while true
-            % The soft-threshold depends on L, so it must be updated
-            % inside the loop whenever L changes
-            thr = P.eps / L;
-            st  = @(u) sign(u) .* max(abs(u) - thr, 0);   % S_{eps/L}
-
-            % 1. Gradient descent step
-            v = z - gradZ / L;
-
-            % 2. Project v to get bNew
-            if P.hasEq
-                h   = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
-                lam = bisect_root(h, max(1, max(abs(v))));
-            else
-                lam = 0;
-            end
-            bNew = min(P.bUp, max(P.bLo, st(v - lam)));
-
-            % 3. Lazy update & evaluate
-            dB    = bNew - b;
-            KdB   = ker.mul(sparse(dB));
-            gbNew = gb + KdB;
-
-            fNew  = plotted_objective(P, bNew, gbNew, y);
-
-            D = bNew - z;
-            Q = fz + sum(D .* gradZ) + (L / 2) * sum(D .^ 2);
-
-            if fNew <= Q + 1e-12 * max(1, abs(fz))
-                break; % accept
-            end
-            L = eta * L; % half step
+        if P.hasEq
+            h   = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
+            lam = bisect_root(h, max(1, max(abs(v))));
+        else
+            lam = 0;
         end
-        L = max(L * shrink, 1e-12);
+        bNew = min(P.bUp, max(P.bLo, st(v - lam)));
 
+        dB        = bNew - b;
         converged = norm(dB) <= opts.tol * max(1, norm(b));
 
-        % --- Momentum ---
         theta = 0;
         if opts.accel
-            if (z - bNew)' * dB > 0 % gradient restart
+            if (z - bNew)' * dB > 0              % gradient restart
                 tk = 1;
             else
                 tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
@@ -1162,12 +1140,11 @@ function out = solve_svr(ker, y, P, opts)
         end
         z = bNew + theta * dB;
 
-        % --- Lazy kernel-image maintenance ---
         sinceRefresh = sinceRefresh + 1;
         gbPrev       = gb;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dB) < 0.5 * n
-            gb = gbNew; % reuse from backtrace
+            gb = gb + ker.mul(sparse(dB));
         else
             gb           = ker.mul(bNew);
             sinceRefresh = 0;
@@ -1185,98 +1162,12 @@ function out = solve_svr(ker, y, P, opts)
 
     out = struct('alpha', b, 'hist', hist, 'iters', it, 'skipped', false);
 end
-% function out = solve_svr(ker, y, P, opts)
-% %SOLVE_SVR  Accelerated proximal gradient for the eps-insensitive SVR dual.
-% %
-% %   Eq. 10:  min_b  0.5 b'Kb - y'b + eps ||b||_1
-% %            s.t.   bLo <= b <= bUp,  1'b = 0
-% %
-% %   Iteration, with L = sigma_1(K) and S the soft-threshold at eps/L:
-% %
-% %       v      <- z - (K z - y)/L
-% %       lambda <- root of  sum_i clip(S(v_i - lambda)) = 0     (bisection)
-% %       b      <- clip(S(v - lambda))
 
-%     n   = numel(y);
-%     L   = ker.sig1;
-%     thr = P.eps / L;
-%     st  = @(u) sign(u) .* max(abs(u) - thr, 0);   % S_{eps/L}
 
-%     b            = zeros(n, 1);
-%     z            = b;
-%     tk           = 1;
-%     gb           = zeros(n, 1);          % maintained K*b
-%     gz           = zeros(n, 1);          % maintained K*z
-%     sinceRefresh = 0;
-
-%     hist = init_hist();
-%     clk  = clk_new(P.setupPG);
-
-%     it = 0;
-%     while it < opts.maxIters
-%         it = it + 1;
-
-%         clk = clk_pause(clk);
-%         if mod(it - 1, opts.evalEvery) == 0
-%             f    = plotted_objective(P, b, gb, y);
-%             hist = rec_hist(hist, clk.solve, f);
-%             maybe_print(opts, P.name, it, f);
-%         end
-%         stop = clk.solve >= opts.timeLimit;
-%         clk  = clk_resume(clk);
-%         if stop
-%             break;
-%         end
-
-%         v = z - (gz - y) / L;
-
-%         if P.hasEq
-%             h   = @(lam) sum(min(P.bUp, max(P.bLo, st(v - lam))));
-%             lam = bisect_root(h, max(1, max(abs(v))));
-%         else
-%             lam = 0;
-%         end
-%         bNew = min(P.bUp, max(P.bLo, st(v - lam)));
-
-%         dB        = bNew - b;
-%         converged = norm(dB) <= opts.tol * max(1, norm(b));
-
-%         theta = 0;
-%         if opts.accel
-%             if (z - bNew)' * dB > 0              % gradient restart
-%                 tk = 1;
-%             else
-%                 tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
-%                 theta = (tk - 1) / tk1;
-%                 tk    = tk1;
-%             end
-%         end
-%         z = bNew + theta * dB;
-
-%         sinceRefresh = sinceRefresh + 1;
-%         gbPrev       = gb;
-
-%         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dB) < 0.5 * n
-%             gb = gb + ker.mul(sparse(dB));
-%         else
-%             gb           = ker.mul(bNew);
-%             sinceRefresh = 0;
-%         end
-%         gz = gb + theta * (gb - gbPrev);
-
-%         b = bNew;
-%         if converged
-%             break;
-%         end
-%     end
-
-%     clk  = clk_pause(clk);
-%     hist = rec_hist(hist, clk.solve, plotted_objective(P, b, ker.mul(b), y));
-
-%     out = struct('alpha', b, 'hist', hist, 'iters', it, 'skipped', false);
-% end
 
 function out = solve_mcsvm(ker, y, P, opts)
+%SOLVE_MCSVM  Jacobi-style parallel projected gradient for Crammer-Singer.
+%
 %   min_a  0.5 tr(a'Ka) - <a, E>
 %   s.t.   0 <= a_{i,y_i} <= C_i,  -C_i <= a_{i,j} <= 0 (j != y_i),  a_i 1 = 0
 %
@@ -1289,18 +1180,9 @@ function out = solve_mcsvm(ker, y, P, opts)
 %   The row equality is per-row, so all n root-finds are independent and the
 %   bisection below runs them simultaneously.
 
-
     n = numel(y);
     K = P.K;
-
-    % --- Initializing the local Lipschitz estimate ---
-    if ker.explicit
-        L = max(full(diag(ker.K)));
-    else
-        L = 1;  % RBF k(x,x)=1, or a safe generic lower bound
-    end
-    eta    = 2;     % backtracking growth
-    shrink = 0.98;  % let L drift back down on the active manifold
+    L = ker.sig1;
 
     E   = full(sparse((1:n)', y, 1, n, K));       % 1_ind
     CiK = repmat(P.Ci, 1, K);
@@ -1323,7 +1205,7 @@ function out = solve_mcsvm(ker, y, P, opts)
 
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
-            f    = plotted_objective(P, alpha, GA, y);
+            f    = plotted_objective(P, alpha, GA, y);   % free: GA is maintained
             hist = rec_hist(hist, clk.solve, f);
             maybe_print(opts, P.name, it, f);
         end
@@ -1333,44 +1215,24 @@ function out = solve_mcsvm(ker, y, P, opts)
             break;
         end
 
-        % --- Objective and Gradient at Z ---
-        fZ    = 0.5 * sum(sum(Z .* GZ)) - sum(sum(Z .* E));
-        gradZ = GZ - E;
+        B = Z - (GZ - E) / L;
 
-        % --- Backtracking Line Search ---
-        while true
-            B = Z - gradZ / L;
-
-            % ---- Eq. 16 for every row at once --------------------------------
-            lo = min(B, [], 2) - max(P.Ci) - 1;
-            hi = max(B, [], 2) + 1;
-            for k = 1:80
-                mid      = (lo + hi) / 2;
-                Cl       = min(UP, max(LO, bsxfun(@minus, B, mid)));
-                pos      = sum(Cl, 2) > 0;
-                lo(pos)  = mid(pos);
-                hi(~pos) = mid(~pos);
-            end
+        % ---- Eq. 16 for every row at once --------------------------------
+        % Each h_i is nonincreasing in lambda_i, positive at lo and nonpositive
+        % at hi, so one vectorized bisection resolves all n roots together.
+        lo = min(B, [], 2) - max(P.Ci) - 1;
+        hi = max(B, [], 2) + 1;
+        for k = 1:80
             mid      = (lo + hi) / 2;
-            alphaNew = min(UP, max(LO, bsxfun(@minus, B, mid)));
-
-            dA = alphaNew - alpha;
-
-            % 3. Lazy update & evaluate
-            KdA   = ker.mul(sparse(dA));
-            GAnew = GA + KdA;
-            fNew  = 0.5 * sum(sum(alphaNew .* GAnew)) - sum(sum(alphaNew .* E));
-
-            D = alphaNew - Z;
-            Q = fZ + sum(sum(D .* gradZ)) + (L / 2) * sum(sum(D .^ 2));
-
-            if fNew <= Q + 1e-12 * max(1, abs(fZ))
-                break;                                   % accepted
-            end
-            L = eta * L;                                 % too bold; halve the step
+            Cl       = min(UP, max(LO, bsxfun(@minus, B, mid)));
+            pos      = sum(Cl, 2) > 0;
+            lo(pos)  = mid(pos);
+            hi(~pos) = mid(~pos);
         end
-        L = max(L * shrink, 1e-12);                      % allow downward adaptation
+        mid      = (lo + hi) / 2;
+        alphaNew = min(UP, max(LO, bsxfun(@minus, B, mid)));
 
+        dA        = alphaNew - alpha;
         converged = norm(dA(:)) <= opts.tol * max(1, norm(alpha(:)));
 
         theta = 0;
@@ -1385,11 +1247,13 @@ function out = solve_mcsvm(ker, y, P, opts)
         end
         Z = alphaNew + theta * dA;
 
+        % Rows whose every coordinate stayed clipped at its bound have an
+        % all-zero delta row, so K*dA touches only the active rows.
         sinceRefresh = sinceRefresh + 1;
         GAPrev       = GA;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * numel(dA)
-            GA = GAnew;
+            GA = GA + ker.mul(sparse(dA));
         else
             GA           = ker.mul(alphaNew);
             sinceRefresh = 0;
@@ -1407,348 +1271,6 @@ function out = solve_mcsvm(ker, y, P, opts)
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
-
-
-function out = solve_nusvm(ker, y, P, opts)
-%SOLVE_NUSVM  Accelerated projected gradient for the nu-SVM dual.
-%
-%   min_a  0.5 a'Ka
-%   s.t.   0 <= a <= up,  <a, y> = 0,  sum(a) >= nu
-%
-%   There is no linear term, so the mass constraint is what makes the problem
-%   non-trivial: drop it and a = 0 is optimal. Each iteration projects onto
-%   {0 <= a <= up, y'a = 0} (Eq. 21) and, if the mass constraint is violated,
-%   re-projects with one multiplier per class so that each class carries nu/2
-%   (Eqs. 22-23).
-
-    n  = numel(y);
-    up = P.up;
-    ip = (y > 0);
-    im = ~ip;
-
-    % --- Initializing the local Lipschitz estimate ---
-    if ker.explicit
-        L = max(full(diag(ker.K)));
-    else
-        L = 1;  % RBF k(x,x)=1, or a safe generic lower bound
-    end
-    eta    = 2;     % backtracking growth
-    shrink = 0.98;  % let L drift back down on the active manifold
-
-    alpha        = zeros(n, 1);
-    z            = alpha;
-    tk           = 1;
-    ga           = zeros(n, 1);          % maintained K*alpha
-    gz           = zeros(n, 1);          % maintained K*z
-    sinceRefresh = 0;
-
-    hist = init_hist();
-    clk  = clk_new(P.setupPG);
-
-    it = 0;
-    while it < opts.maxIters
-        it = it + 1;
-
-        clk = clk_pause(clk);
-        if it > 1 && mod(it - 1, opts.evalEvery) == 0
-            f    = plotted_objective(P, alpha, ga, y);
-            hist = rec_hist(hist, clk.solve, f);
-            maybe_print(opts, P.name, it, f);
-        end
-        stop = clk.solve >= opts.timeLimit;
-        clk  = clk_resume(clk);
-        if stop
-            break;
-        end
-
-        % --- Objective and Gradient at z ---
-        fz    = plotted_objective(P, z, gz, y);
-        gradZ = gz;
-
-        % --- Backtracking Line Search ---
-        while true
-            B = z - gradZ / L;
-
-            % ---- Eq. 21: project onto {0 <= a <= up, y'a = 0} -----------------
-            h   = @(lam) sum(y .* min(up, max(B - lam * y, 0)));
-            lam = bisect_root(h, max(1, max(abs(B))));
-            aNew = min(up, max(B - lam * y, 0));
-
-            % ---- Eqs. 22-23: enforce nu/2 of mass in each class ---------------
-            if sum(aNew) < P.nu - 1e-12
-                hp = @(l) sum(min(up(ip), max(B(ip) - l, 0))) - P.nu / 2;
-                hm = @(l) sum(min(up(im), max(B(im) - l, 0))) - P.nu / 2;
-                lp = bisect_root(hp, max(1, max(abs(B(ip)))));
-                lm = bisect_root(hm, max(1, max(abs(B(im)))));
-
-                aNew(ip) = min(up(ip), max(B(ip) - lp, 0));
-                aNew(im) = min(up(im), max(B(im) - lm, 0));
-            end
-
-            % 3. Lazy update & evaluate
-            dA    = aNew - alpha;
-            KdA   = ker.mul(sparse(dA));
-            gaNew = ga + KdA;
-
-            fNew  = plotted_objective(P, aNew, gaNew, y);
-
-            D = aNew - z;
-            Q = fz + sum(D .* gradZ) + (L / 2) * sum(D .^ 2);
-
-            if fNew <= Q + 1e-12 * max(1, abs(fz))
-                break;
-            end
-            L = eta * L;
-        end
-        L = max(L * shrink, 1e-12);
-
-        converged = norm(dA) <= opts.tol * max(1, norm(alpha));
-
-        theta = 0;
-        if opts.accel
-            if (z - aNew)' * dA > 0                  % gradient restart
-                tk = 1;
-            else
-                tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
-                theta = (tk - 1) / tk1;
-                tk    = tk1;
-            end
-        end
-        z = aNew + theta * dA;
-
-        sinceRefresh = sinceRefresh + 1;
-        gaPrev       = ga;
-
-        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
-            ga = gaNew;
-        else
-            ga           = ker.mul(aNew);
-            sinceRefresh = 0;
-        end
-        gz = ga + theta * (ga - gaPrev);
-
-        alpha = aNew;
-        if converged
-            break;
-        end
-    end
-
-    clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
-
-    out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
-end
-
-% function out = solve_mcsvm(ker, y, P, opts)
-% %SOLVE_MCSVM  Jacobi-style parallel projected gradient for Crammer-Singer.
-% %
-% %   min_a  0.5 tr(a'Ka) - <a, E>
-% %   s.t.   0 <= a_{i,y_i} <= C_i,  -C_i <= a_{i,j} <= 0 (j != y_i),  a_i 1 = 0
-% %
-% %   Iteration, with L = sigma_1(K):
-% %
-% %       B <- Z - (K Z - E)/L
-% %       for each row i (in parallel): find lambda_i satisfying Eq. 16 by
-% %       bisection, then a_i <- clip(B_i - lambda_i)
-% %
-% %   The row equality is per-row, so all n root-finds are independent and the
-% %   bisection below runs them simultaneously.
-
-%     n = numel(y);
-%     K = P.K;
-%     L = ker.sig1;
-
-%     E   = full(sparse((1:n)', y, 1, n, K));       % 1_ind
-%     CiK = repmat(P.Ci, 1, K);
-%     UP  = E .* CiK;                               % [0, C_i] at the true class
-%     LO  = (E - 1) .* CiK;                         % [-C_i, 0] elsewhere
-
-%     alpha        = zeros(n, K);
-%     Z            = alpha;
-%     tk           = 1;
-%     GA           = zeros(n, K);          % maintained K*alpha
-%     GZ           = zeros(n, K);          % maintained K*Z
-%     sinceRefresh = 0;
-
-%     hist = init_hist();
-%     clk  = clk_new(P.setupPG);
-
-%     it = 0;
-%     while it < opts.maxIters
-%         it = it + 1;
-
-%         clk = clk_pause(clk);
-%         if mod(it - 1, opts.evalEvery) == 0
-%             f    = plotted_objective(P, alpha, GA, y);   % free: GA is maintained
-%             hist = rec_hist(hist, clk.solve, f);
-%             maybe_print(opts, P.name, it, f);
-%         end
-%         stop = clk.solve >= opts.timeLimit;
-%         clk  = clk_resume(clk);
-%         if stop
-%             break;
-%         end
-
-%         B = Z - (GZ - E) / L;
-
-%         % ---- Eq. 16 for every row at once --------------------------------
-%         % Each h_i is nonincreasing in lambda_i, positive at lo and nonpositive
-%         % at hi, so one vectorized bisection resolves all n roots together.
-%         lo = min(B, [], 2) - max(P.Ci) - 1;
-%         hi = max(B, [], 2) + 1;
-%         for k = 1:80
-%             mid      = (lo + hi) / 2;
-%             Cl       = min(UP, max(LO, bsxfun(@minus, B, mid)));
-%             pos      = sum(Cl, 2) > 0;
-%             lo(pos)  = mid(pos);
-%             hi(~pos) = mid(~pos);
-%         end
-%         mid      = (lo + hi) / 2;
-%         alphaNew = min(UP, max(LO, bsxfun(@minus, B, mid)));
-
-%         dA        = alphaNew - alpha;
-%         converged = norm(dA(:)) <= opts.tol * max(1, norm(alpha(:)));
-
-%         theta = 0;
-%         if opts.accel
-%             if sum(sum((Z - alphaNew) .* dA)) > 0    % gradient restart
-%                 tk = 1;
-%             else
-%                 tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
-%                 theta = (tk - 1) / tk1;
-%                 tk    = tk1;
-%             end
-%         end
-%         Z = alphaNew + theta * dA;
-
-%         % Rows whose every coordinate stayed clipped at its bound have an
-%         % all-zero delta row, so K*dA touches only the active rows.
-%         sinceRefresh = sinceRefresh + 1;
-%         GAPrev       = GA;
-
-%         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * numel(dA)
-%             GA = GA + ker.mul(sparse(dA));
-%         else
-%             GA           = ker.mul(alphaNew);
-%             sinceRefresh = 0;
-%         end
-%         GZ = GA + theta * (GA - GAPrev);
-
-%         alpha = alphaNew;
-%         if converged
-%             break;
-%         end
-%     end
-
-%     clk  = clk_pause(clk);
-%     hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
-
-%     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
-% end
-
-
-% function out = solve_nusvm(ker, y, P, opts)
-% %SOLVE_NUSVM  Accelerated projected gradient for the nu-SVM dual.
-% %
-% %   min_a  0.5 a'Ka
-% %   s.t.   0 <= a <= up,  <a, y> = 0,  sum(a) >= nu
-% %
-% %   There is no linear term, so the mass constraint is what makes the problem
-% %   non-trivial: drop it and a = 0 is optimal. Each iteration projects onto
-% %   {0 <= a <= up, y'a = 0} (Eq. 21) and, if the mass constraint is violated,
-% %   re-projects with one multiplier per class so that each class carries nu/2
-% %   (Eqs. 22-23).
-
-%     n  = numel(y);
-%     L  = ker.sig1;
-%     up = P.up;
-%     ip = (y > 0);
-%     im = ~ip;
-
-%     alpha        = zeros(n, 1);
-%     z            = alpha;
-%     tk           = 1;
-%     ga           = zeros(n, 1);          % maintained K*alpha
-%     gz           = zeros(n, 1);          % maintained K*z
-%     sinceRefresh = 0;
-
-%     hist = init_hist();
-%     clk  = clk_new(P.setupPG);
-
-%     it = 0;
-%     while it < opts.maxIters
-%         it = it + 1;
-
-%         clk = clk_pause(clk);
-%         % alpha = 0 at it == 1 violates sum(alpha) >= nu and has f = 0 < f*,
-%         % which would wreck a log-suboptimality plot. Start recording once the
-%         % iterate is feasible, i.e. after the first projection.
-%         if it > 1 && mod(it - 1, opts.evalEvery) == 0
-%             f    = plotted_objective(P, alpha, ga, y);
-%             hist = rec_hist(hist, clk.solve, f);
-%             maybe_print(opts, P.name, it, f);
-%         end
-%         stop = clk.solve >= opts.timeLimit;
-%         clk  = clk_resume(clk);
-%         if stop
-%             break;
-%         end
-
-%         B = z - gz / L;
-
-%         % ---- Eq. 21: project onto {0 <= a <= up, y'a = 0} -----------------
-%         h   = @(lam) sum(y .* min(up, max(B - lam * y, 0)));
-%         lam = bisect_root(h, max(1, max(abs(B))));
-%         a   = min(up, max(B - lam * y, 0));
-
-%         % ---- Eqs. 22-23: enforce nu/2 of mass in each class ---------------
-%         if sum(a) < P.nu - 1e-12
-%             hp = @(l) sum(min(up(ip), max(B(ip) - l, 0))) - P.nu / 2;
-%             hm = @(l) sum(min(up(im), max(B(im) - l, 0))) - P.nu / 2;
-%             lp = bisect_root(hp, max(1, max(abs(B(ip)))));
-%             lm = bisect_root(hm, max(1, max(abs(B(im)))));
-
-%             a(ip) = min(up(ip), max(B(ip) - lp, 0));
-%             a(im) = min(up(im), max(B(im) - lm, 0));
-%         end
-
-%         dA        = a - alpha;
-%         converged = norm(dA) <= opts.tol * max(1, norm(alpha));
-
-%         theta = 0;
-%         if opts.accel
-%             if (z - a)' * dA > 0                 % gradient restart
-%                 tk = 1;
-%             else
-%                 tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
-%                 theta = (tk - 1) / tk1;
-%                 tk    = tk1;
-%             end
-%         end
-%         z = a + theta * dA;
-
-%         sinceRefresh = sinceRefresh + 1;
-%         gaPrev       = ga;
-
-%         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
-%             ga = ga + ker.mul(sparse(dA));
-%         else
-%             ga           = ker.mul(a);
-%             sinceRefresh = 0;
-%         end
-%         gz = ga + theta * (ga - gaPrev);
-
-%         alpha = a;
-%         if converged
-%             break;
-%         end
-%     end
-
-%     clk  = clk_pause(clk);
-%     hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
-
-%     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
-% end
 
 
 %% ======================================================================
@@ -2913,4 +2435,186 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     legend('Location', 'best');
     saveas(fig, figPath);
     close(fig);
+end
+
+function results = gamma_sweep(matFile, opts0)
+%GAMMA_SWEEP  Walk rho = sigma_1(K)/max_i K_ii down via rbfGamma, on the
+%   UNMODIFIED box-only dual (biasMode='none', s=0), and time PG vs DCD to a
+%   fixed suboptimality target. Prints gamma | rho | PG-time | DCD-time |
+%   test-acc | winner. rho is measured, not set; gamma is the only knob moved.
+
+    gammas = opts0.sweepGamma(:)';
+    target = 1e-6;                          % f - f* threshold for "reached"
+
+    % One train/test split, reused across gammas so accuracy is comparable.
+    [Xall, yall] = load_xy_from_mat(matFile);
+    rng(1); nAll = size(Xall,1); perm = randperm(nAll);
+    nTr = round(0.8*nAll);
+    trI = perm(1:nTr); teI = perm(nTr+1:end);
+
+    fprintf('\n gamma |     rho |  PG (s) | DCD (s) | SMO (s) | acc%% | libAcc%% | winner\n');
+    fprintf('-------+---------+---------+---------+---------+------+---------+--------\n');
+
+    rows = [];
+    for g = gammas
+        o = opts0;
+        o = rmfield(o, 'sweepGamma');       % avoid re-dispatch into this fn
+        o.problem   = 'l2svm';
+        o.kernel    = 'rbf';
+        o.biasMode  = 'none';               % s forced to 0 -> true problem
+        o.rbfGamma  = g;
+        o.makeFigure = false;
+        o.overwrite  = true;
+        o.verbose    = false;
+
+        % Run the real pipeline on the TRAIN split only.
+        Xtr = Xall(trI,:); ytr = yall(trI);
+        r   = run_one(Xtr, ytr, o);         % helper below: full solve, no figure
+
+        tPG  = time_to_target(r.pg.hist,  target);
+        tDCD = time_to_target(r.dcd.hist, target);
+        tSMO = time_to_target(r.smo.hist, target);
+
+        acc  = rbf_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g, o.C);
+        lacc = libsvm_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), g, o.C);
+
+        % winner across all three
+        cand = [tPG tDCD tSMO];
+        names = {'PG','DCD','SMO'};
+        if all(isnan(cand)), win = '--';
+        else, [~,wi] = min(cand); win = names{wi};
+        end
+
+        fprintf(' %5.2f | %7.2f | %7s | %7s | %7s | %4.1f | %5.1f | %s\n', ...
+            g, r.rho, fmt(tPG), fmt(tDCD), fmt(tSMO), 100*acc, 100*lacc, win);
+        rows = [rows; g, r.rho, tPG, tDCD, acc]; %#ok<AGROW>
+    end
+    results = struct('gammas', gammas, 'table', rows);
+end
+
+function s = fmt(t); if isnan(t), s='  ---'; else, s=sprintf('%.2f',t); end; end
+
+function t = time_to_target(hist, target)
+%TIME_TO_TARGET  First recorded time at which f - f* <= target.
+    fstar = min(hist.f);                    % panel-local; fine for crossover timing
+    hit   = find(hist.f - fstar <= target, 1, 'first');
+    if isempty(hit), t = NaN; else, t = hist.t(hit); end
+end
+
+function r = run_one(X, y, opts)
+%RUN_ONE  Build kernel + solve PG and DCD on (X,y) with given opts. No figure.
+%   Returns r.rho, r.pg (solve_l1l2 out), r.dcd (baseline_dcd_binary out).
+%   Mirrors the main-function block between kernel build and figure.
+    opts = fill_default_opts(opts);
+
+    meta = struct('task','binary','K',2);
+    P    = make_problem(y, meta, opts);
+
+    ker  = make_kernel_op(X, y, P, opts);
+    ker  = augment_kernel_bias(ker, y, P, opts);   % s=0 under 'none' -> no-op
+
+    P.setupGram = ker.gramTime;
+    P.setupPG   = ker.gramTime + ker.sig1Time;
+
+    % rho on the UNSHIFTED Gram: sig1 carries the 1.05 factor, divide it out.
+    % RBF => max_i K_ii = 1, so rho = sigma_1(K).
+    r.rho = (ker.sig1 / 1.05) / 1;
+
+    r.pg  = solve_l1l2(ker, y, P, opts);
+    r.dcd = baseline_dcd_binary(ker, X, y, P, opts);
+    r.smo = baseline_libsvm_sweep(ker, X, y, P, opts);
+end
+
+function acc = rbf_test_acc(Xtr, ytr, Xte, yte, alpha, gamma, ~)
+%RBF_TEST_ACC  Accuracy of the biasMode='none' L2-SVM classifier.
+%   alpha is the multiplier on the SIGNED Gram, so the score already folds y in
+%   as (y_tr .* alpha). No bias term exists under 'none' (b = 0).
+
+    sv   = find(abs(alpha) > 0);
+    if isempty(sv), acc = mean(yte == sign(0.5 - rand)); return; end  % degenerate
+
+    coef = ytr(sv) .* alpha(sv);                 % signed coefficients
+    Kte  = rbf_gram(Xte, Xtr(sv,:), gamma);      % nTe x |sv|, UNsigned kernel
+    score = Kte * coef;                          % no bias under 'none'
+    pred  = sign(score);  pred(pred == 0) = 1;
+    acc   = mean(pred == yte);
+end
+
+function acc = libsvm_test_acc(Xtr, ytr, Xte, yte, gamma, C)
+%LIBSVM_TEST_ACC  Reference accuracy from LIBSVM C-SVC with matched RBF.
+%   Ground-truth cross-check for rbf_test_acc. NOTE: -s 0 is L1-SVM, not the
+%   paper's L2 dual -- fine for a sign/ballpark check and for gamma selection,
+%   which are insensitive to the L1/L2 distinction.
+    if exist('svmtrain','file') ~= 3 && exist('./libsvm-336/matlab','dir')
+        addpath('./libsvm-336/matlab');
+    end
+    if exist('svmtrain','file') ~= 3
+        acc = NaN; return;                       % LIBSVM absent: skip, don't crash
+    end
+    model = svmtrain(ytr, sparse(Xtr), ...
+                     sprintf('-s 0 -t 2 -g %g -c %g -q', gamma, C));
+    pred  = svmpredict(yte, sparse(Xte), model, '-q');
+    acc   = mean(pred == yte);
+end
+
+
+function results = cv_gamma_sweep(matFile, opts0)
+%CV_GAMMA_SWEEP  k-fold CV accuracy vs gamma, to locate the generalization
+%   peak relative to the PG/DCD crossover. Uses LIBSVM as the accuracy oracle
+%   (matched RBF), so it is independent of our own test-accuracy convention and
+%   doubles as the sign sanity-check. Prints gamma | rho | CV acc (mean+/-std).
+    gammas = opts0.cvGamma(:)';
+    k = 5; if isfield(opts0,'cvFolds') && ~isempty(opts0.cvFolds), k = opts0.cvFolds; end
+    C = 1; if isfield(opts0,'C')       && ~isempty(opts0.C),       C = opts0.C;       end
+
+    if exist('svmtrain','file') ~= 3 && exist('./libsvm-336/matlab','dir')
+        addpath('./libsvm-336/matlab');
+    end
+    if exist('svmtrain','file') ~= 3
+        error('cv_gamma_sweep: LIBSVM svmtrain mex not on path.');
+    end
+
+    [Xall, yall] = load_xy_from_mat(matFile);
+    o0 = fill_default_opts(struct('problem','l2svm'));
+    [Xall, yall] = preprocess_xy(Xall, yall, o0);   % same standardize + -/+1 as the sweep
+    n = size(Xall,1);
+
+    rng(1);
+    fold = mod(randperm(n)' - 1, k) + 1;            % random fold labels 1..k
+
+    fprintf('\n gamma |     rho | CV acc%% (mean +/- std)\n');
+    fprintf('-------+---------+------------------------\n');
+
+    accMean = zeros(size(gammas));
+    for gi = 1:numel(gammas)
+        g = gammas(gi);
+        foldAcc = zeros(k,1);
+        for f = 1:k
+            teI = (fold == f);  trI = ~teI;
+            model = svmtrain(yall(trI), sparse(Xall(trI,:)), ...
+                             sprintf('-s 0 -t 2 -g %g -c %g -q', g, C));
+            pred  = svmpredict(yall(teI), sparse(Xall(teI,:)), model, '-q');
+            foldAcc(f) = mean(pred == yall(teI));
+        end
+        accMean(gi) = mean(foldAcc);
+        rho = gamma_rho(Xall, yall, g);
+        fprintf(' %5.2f | %7.2f |     %5.1f +/- %4.1f\n', ...
+                g, rho, 100*mean(foldAcc), 100*std(foldAcc));
+    end
+
+    [~, best] = max(accMean);
+    fprintf('CV pick: gamma = %.2f  (%.1f%% held-out)\n', gammas(best), 100*accMean(best));
+    results = struct('gammas', gammas, 'cvAcc', accMean, 'pick', gammas(best));
+end
+
+
+function rho = gamma_rho(X, y, gamma)   %#ok<INUSL>
+%GAMMA_RHO  rho = sigma_1(K)/max_i K_ii for the RBF Gram at this gamma.
+%   Signing K by (y y') is an orthogonal congruence (y = +/-1), so it leaves the
+%   spectrum unchanged; we skip it and use the raw Gram. Builds the dense K
+%   (~6 s, transient) -- negligible next to the k LIBSVM trains per gamma.
+    K = rbf_gram(X, X, gamma);
+    optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
+    s1 = eigs(@(a) K*a, size(K,1), 1, 'largestabs', optsE);
+    rho = abs(s1) / max(full(diag(K)));          % RBF: max diag = 1
 end
