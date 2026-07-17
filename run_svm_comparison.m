@@ -76,6 +76,7 @@ function results = run_svm_comparison(matFile, opts)
     matFile = '/scratch/marque6/libsvm_data/rcv1_binary.mat';
     if nargin >= 2 && isfield(opts, 'cvGamma')
         results = cv_gamma_sweep(matFile, opts);
+        results = median_test();
         return;
     end
 
@@ -2437,6 +2438,17 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     close(fig);
 end
 
+function printVoid = median_test()
+    [Xall,yall] = load_xy_from_mat(data);
+    o0 = fill_default_opts(struct('problem','l2svm'));
+    [Xall,yall] = preprocess_xy(Xall,yall,o0);
+    % median squared pairwise distance on a small sample
+    s = Xall(randperm(size(Xall,1),500),:);
+    D2 = pdist2(full(s),full(s)).^2;
+    med = median(D2(D2>0));
+    fprintf('median ||xi-xj||^2 = %.4g  -> sensible gamma ~ %.4g\n', med, 1/med);
+end
+
 function results = gamma_sweep(matFile, opts0)
 %GAMMA_SWEEP  Walk rho = sigma_1(K)/max_i K_ii down via rbfGamma, on the
 %   UNMODIFIED box-only dual (biasMode='none', s=0), and time PG vs DCD to a
@@ -2609,12 +2621,11 @@ end
 
 
 function rho = gamma_rho(X, y, gamma)   %#ok<INUSL>
-%GAMMA_RHO  rho = sigma_1(K)/max_i K_ii for the RBF Gram at this gamma.
-%   Signing K by (y y') is an orthogonal congruence (y = +/-1), so it leaves the
-%   spectrum unchanged; we skip it and use the raw Gram. Builds the dense K
-%   (~6 s, transient) -- negligible next to the k LIBSVM trains per gamma.
+    fprintf('   [gamma_rho: gamma=%g, size(X)=%dx%d]\n', gamma, size(X,1), size(X,2));
     K = rbf_gram(X, X, gamma);
+    fprintf('   [K(1,2)=%.4g, max offdiag row1=%.4g]\n', K(1,2), max(K(1,2:end)));
     optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
     s1 = eigs(@(a) K*a, size(K,1), 1, 'largestabs', optsE);
-    rho = abs(s1) / max(full(diag(K)));          % RBF: max diag = 1
+    rho = abs(s1) / max(full(diag(K)));
+    fprintf('   [sig1=%.4g, maxdiag=%.4g, rho=%.4g]\n', abs(s1), max(full(diag(K))), rho);
 end

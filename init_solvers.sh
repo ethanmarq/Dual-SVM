@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-salloc --mem=64gb --cpus-per-task=16 --time=04:00:00
+salloc --mem=64gb --cpus-per-task=16 --time=08:00:00
 module load matlab
 matlab -nodisplay
 data="/scratch/marque6/libsvm_data/rcv1_binary.mat";
