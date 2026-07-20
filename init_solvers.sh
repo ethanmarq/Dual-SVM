@@ -13,5 +13,11 @@ run_svm_comparison(data, struct('problem', 'mcsvm','overwrite', true))
 
 data="/scratch/marque6/libsvm_data/rcv1_train.mat";
 
-run_svm_comparison(data, struct('overwrite', true, 'sweepGamma', [2 2.5 3 3.5 4], 'C', 1));
+
+salloc --mem=64gb --cpus-per-task=16 --time=08:00:00
+module load matlab
+matlab -nodisplay
+run_svm_comparison(data, struct('overwrite', true, 'sweepGamma', [2 3 4 5], 'C', 1));
+exit
+exit
 run_svm_comparison(data, struct('overwrite', true, 'cvGamma', [0.5 1 2 2.5 3 3.5 4 8], 'C', 1));

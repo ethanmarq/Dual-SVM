@@ -73,12 +73,16 @@ function results = run_svm_comparison(matFile, opts)
     addpath('./libsvm-336/matlab');
     addpath('./liblinear-249/matlab');
 
-    matFile = '/scratch/marque6/libsvm_data/rcv1_binary.mat';
-    if nargin >= 2 && isfield(opts, 'cvGamma')
-        results = cv_gamma_sweep(matFile, opts);
-        results = median_test();
+    matFile = "/scratch/marque6/libsvm_data/rcv1_binary.mat";
+    if nargin >= 2 && isfield(opts, 'sweepGamma')
+        results = gamma_sweep(matFile, opts);
         return;
     end
+    if nargin >= 2 && isfield(opts, 'cvGamma')
+        results = cv_gamma_sweep(matFile, opts);
+        return;
+    end
+
 
 
 
@@ -228,7 +232,7 @@ function opts = fill_default_opts(opts)
 
     % kernel
     opts = set_default(opts, 'kernel',   'rbf');     % 'linear' | 'rbf'
-    opts = set_default(opts, 'rbfGamma', 3);       % k = exp(-g||x - x'||^2),
+    opts = set_default(opts, 'rbfGamma', 2.5);       % k = exp(-g||x - x'||^2),
                                                      % g = 1/(2r^2), radius 1
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
 
@@ -239,7 +243,7 @@ function opts = fill_default_opts(opts)
     % proximal solver
     opts = set_default(opts, 'accel',       true);
     opts = set_default(opts, 'lazy',        true);   % incremental K*delta updates
-    opts = set_default(opts, 'lazyRefresh', 100);    % full recompute cadence (FP drift)
+    opts = set_default(opts, 'lazyRefresh', 500);    % full recompute cadence (FP drift)
     opts = set_default(opts, 'maxIters',    5000);
     opts = set_default(opts, 'tol',         1e-12);
     opts = set_default(opts, 'timeLimit',   60);
@@ -254,8 +258,8 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'binarize',     struct('type', 'halfsplit'));
     opts = set_default(opts, 'mcBins',       4);
     opts = set_default(opts, 'maxSamples',   inf);
-    opts = set_default(opts, 'standardize',  true);
-    opts = set_default(opts, 'standardizeY', true);
+    opts = set_default(opts, 'standardize',  false);
+    opts = set_default(opts, 'standardizeY', false);
 
     % baselines
     opts = set_default(opts, 'smoTolerances', 10 .^ -(1:8));
@@ -927,7 +931,6 @@ end
 %% ======================================================================
 %  Proposed solvers: accelerated projected gradient on the dual
 %  ======================================================================
-
 function out = solve_l1l2(ker, y, P, opts)
 %SOLVE_L1L2  Accelerated projected gradient for the L1-/L2-SVM dual.
 %
@@ -985,58 +988,28 @@ function out = solve_l1l2(ker, y, P, opts)
             break;
         end
 
-
         % ---- gradient step, then project ---------------------------------
-        eta    = 2;      % backtracking growth
-        shrink = 0.98;   % let L drift back down on the active manifold
+        beta  = z - grad / L;
+        scale = max(1, max(abs(beta)));
 
-        fZ    = plotted_objective(P, z, gz, y);
-        if isL2
-            gradZ = gz + z ./ P.Ci - 1;
-        else
-            gradZ = gz - 1;
-        end
-
-        while true
-            % 1. Gradient descent step
-            beta = z - gradZ / L;
-
-            % 2. Project beta to get alphaNew
-            scale = max(1, max(abs(beta)));
-
-            if P.hasEq
-                if isL2
-                    h = @(lam) sum(y .* max(beta - lam * y, 0));
-                else
-                    h = @(lam) sum(y .* min(P.Ci, max(beta - lam * y, 0)));
-                end
-                lam = bisect_root(h, scale);
-            else
-                lam = 0;
-            end
-
+        if P.hasEq
             if isL2
-                alphaNew = max(beta - lam * y, 0);
+                h = @(lam) sum(y .* max(beta - lam * y, 0));
             else
-                alphaNew = min(P.Ci, max(beta - lam * y, 0));
+                h = @(lam) sum(y .* min(P.Ci, max(beta - lam * y, 0)));
             end
-
-            % 3. Lazy update & evaluate
-            dA    = alphaNew - alpha;
-            KdA   = ker.mul(sparse(dA));
-            GAnew = ga + KdA;
-
-            fNew  = plotted_objective(P, alphaNew, GAnew, y);
-
-            D = alphaNew - z;
-            Q = fZ + sum(D .* gradZ) + (L / 2) * sum(D .^ 2);
-
-            if fNew <= Q + 1e-12 * max(1, abs(fZ))
-                break;
-            end
-            L = eta * L;
+            lam = bisect_root(h, scale);
+        else
+            lam = 0;
         end
-        L = max(L * shrink, 1e-12);
+
+        if isL2
+            alphaNew = max(beta - lam * y, 0);
+        else
+            alphaNew = min(P.Ci, max(beta - lam * y, 0));
+        end
+
+        dA        = alphaNew - alpha;
         converged = norm(dA) <= opts.tol * max(1, norm(alpha));
 
         % ---- momentum ----------------------------------------------------
@@ -1050,11 +1023,15 @@ function out = solve_l1l2(ker, y, P, opts)
         z = alphaNew + theta * dA;
 
         % ---- lazy kernel-image maintenance -------------------------------
+        % Bound coordinates have dA_i = 0 exactly (clip to clip), so late-phase
+        % deltas are supported on the free SVs only and K*dA is a cheap sparse
+        % matvec. z is a linear combination of the last two iterates, so K*z
+        % falls out of the two maintained images with no extra matvec.
         sinceRefresh = sinceRefresh + 1;
         gaPrev       = ga;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
-            ga = GAnew;
+            ga = ga + ker.mul(sparse(dA));
         else
             ga           = ker.mul(alphaNew);    % periodic full refresh
             sinceRefresh = 0;
@@ -1272,6 +1249,110 @@ function out = solve_mcsvm(ker, y, P, opts)
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
+
+function out = solve_nusvm(ker, y, P, opts)
+%SOLVE_NUSVM  Accelerated projected gradient for the nu-SVM dual.
+%
+%   min_a  0.5 a'Ka
+%   s.t.   0 <= a <= up,  <a, y> = 0,  sum(a) >= nu
+%
+%   There is no linear term, so the mass constraint is what makes the problem
+%   non-trivial: drop it and a = 0 is optimal. Each iteration projects onto
+%   {0 <= a <= up, y'a = 0} (Eq. 21) and, if the mass constraint is violated,
+%   re-projects with one multiplier per class so that each class carries nu/2
+%   (Eqs. 22-23).
+
+    n  = numel(y);
+    L  = ker.sig1;
+    up = P.up;
+    ip = (y > 0);
+    im = ~ip;
+
+    alpha        = zeros(n, 1);
+    z            = alpha;
+    tk           = 1;
+    ga           = zeros(n, 1);          % maintained K*alpha
+    gz           = zeros(n, 1);          % maintained K*z
+    sinceRefresh = 0;
+
+    hist = init_hist();
+    clk  = clk_new(P.setupPG);
+
+    it = 0;
+    while it < opts.maxIters
+        it = it + 1;
+
+        clk = clk_pause(clk);
+        % alpha = 0 at it == 1 violates sum(alpha) >= nu and has f = 0 < f*,
+        % which would wreck a log-suboptimality plot. Start recording once the
+        % iterate is feasible, i.e. after the first projection.
+        if it > 1 && mod(it - 1, opts.evalEvery) == 0
+            f    = plotted_objective(P, alpha, ga, y);
+            hist = rec_hist(hist, clk.solve, f);
+            maybe_print(opts, P.name, it, f);
+        end
+        stop = clk.solve >= opts.timeLimit;
+        clk  = clk_resume(clk);
+        if stop
+            break;
+        end
+
+        B = z - gz / L;
+
+        % ---- Eq. 21: project onto {0 <= a <= up, y'a = 0} -----------------
+        h   = @(lam) sum(y .* min(up, max(B - lam * y, 0)));
+        lam = bisect_root(h, max(1, max(abs(B))));
+        a   = min(up, max(B - lam * y, 0));
+
+        % ---- Eqs. 22-23: enforce nu/2 of mass in each class ---------------
+        if sum(a) < P.nu - 1e-12
+            hp = @(l) sum(min(up(ip), max(B(ip) - l, 0))) - P.nu / 2;
+            hm = @(l) sum(min(up(im), max(B(im) - l, 0))) - P.nu / 2;
+            lp = bisect_root(hp, max(1, max(abs(B(ip)))));
+            lm = bisect_root(hm, max(1, max(abs(B(im)))));
+
+            a(ip) = min(up(ip), max(B(ip) - lp, 0));
+            a(im) = min(up(im), max(B(im) - lm, 0));
+        end
+
+        dA        = a - alpha;
+        converged = norm(dA) <= opts.tol * max(1, norm(alpha));
+
+        theta = 0;
+        if opts.accel
+            if (z - a)' * dA > 0                 % gradient restart
+                tk = 1;
+            else
+                tk1   = (1 + sqrt(1 + 4 * tk ^ 2)) / 2;
+                theta = (tk - 1) / tk1;
+                tk    = tk1;
+            end
+        end
+        z = a + theta * dA;
+
+        sinceRefresh = sinceRefresh + 1;
+        gaPrev       = ga;
+
+        if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
+            ga = ga + ker.mul(sparse(dA));
+        else
+            ga           = ker.mul(a);
+            sinceRefresh = 0;
+        end
+        gz = ga + theta * (ga - gaPrev);
+
+        alpha = a;
+        if converged
+            break;
+        end
+    end
+
+    clk  = clk_pause(clk);
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
+
+    out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
+end
+
 
 
 %% ======================================================================
@@ -2436,17 +2517,6 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     legend('Location', 'best');
     saveas(fig, figPath);
     close(fig);
-end
-
-function printVoid = median_test()
-    [Xall,yall] = load_xy_from_mat(data);
-    o0 = fill_default_opts(struct('problem','l2svm'));
-    [Xall,yall] = preprocess_xy(Xall,yall,o0);
-    % median squared pairwise distance on a small sample
-    s = Xall(randperm(size(Xall,1),500),:);
-    D2 = pdist2(full(s),full(s)).^2;
-    med = median(D2(D2>0));
-    fprintf('median ||xi-xj||^2 = %.4g  -> sensible gamma ~ %.4g\n', med, 1/med);
 end
 
 function results = gamma_sweep(matFile, opts0)
