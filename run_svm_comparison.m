@@ -73,8 +73,8 @@ function results = run_svm_comparison(matFile, opts)
     addpath('./libsvm-336/matlab');
     addpath('./liblinear-249/matlab');
 
-    matFile = "/scratch/marque6/libsvm_data/rcv1_binary.mat";
     if nargin >= 2 && isfield(opts, 'sweepGamma')
+        matFile = "/scratch/marque6/libsvm_data/rcv1_binary.mat";
         results = gamma_sweep(matFile, opts);
         return;
     end
@@ -2524,12 +2524,26 @@ function results = gamma_sweep(matFile, opts0)
 %   UNMODIFIED box-only dual (biasMode='none', s=0), and time PG vs DCD to a
 %   fixed suboptimality target. Prints gamma | rho | PG-time | DCD-time |
 %   test-acc | winner. rho is measured, not set; gamma is the only knob moved.
-
     gammas = opts0.sweepGamma(:)';
-    target = 1e-6;                          % f - f* threshold for "reached"
+    target = 1e-6;
 
-    % One train/test split, reused across gammas so accuracy is comparable.
-    [Xall, yall] = load_xy_from_mat(matFile);
+    % Single source of truth for which variant the sweep runs.
+    if isfield(opts0,'problem') && ~isempty(opts0.problem)
+        prob = opts0.problem;
+    else
+        prob = 'mcsvm';            % sweep default; was hardcoded in the loop
+    end
+    isMC = strcmp(prob, 'mcsvm');
+
+    [Xall, yraw] = load_xy_from_mat(matFile);
+    if isMC
+        [classes, ~, yall] = unique(yraw);   % yall in 1..K
+        Kcls = numel(classes);
+    else
+        yall = sign(yraw); yall(yall==0) = 1;
+        Kcls = 2;
+    end
+
     rng(1); nAll = size(Xall,1); perm = randperm(nAll);
     nTr = round(0.8*nAll);
     trI = perm(1:nTr); teI = perm(nTr+1:end);
@@ -2541,7 +2555,7 @@ function results = gamma_sweep(matFile, opts0)
     for g = gammas
         o = opts0;
         o = rmfield(o, 'sweepGamma');       % avoid re-dispatch into this fn
-        o.problem   = 'l2svm';
+        o.problem   = prob;
         o.kernel    = 'rbf';
         o.biasMode  = 'none';               % s forced to 0 -> true problem
         o.rbfGamma  = g;
@@ -2551,13 +2565,18 @@ function results = gamma_sweep(matFile, opts0)
 
         % Run the real pipeline on the TRAIN split only.
         Xtr = Xall(trI,:); ytr = yall(trI);
-        r   = run_one(Xtr, ytr, o);         % helper below: full solve, no figure
+        r    = run_one(Xtr, ytr, o, Kcls);
 
         tPG  = time_to_target(r.pg.hist,  target);
         tDCD = time_to_target(r.dcd.hist, target);
         tSMO = time_to_target(r.smo.hist, target);
 
-        acc  = rbf_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g, o.C);
+        if isMC
+            acc = mc_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g);
+        else
+            acc = rbf_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g, o.C);
+        end
+
         lacc = libsvm_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), g, o.C);
 
         % winner across all three
@@ -2583,28 +2602,33 @@ function t = time_to_target(hist, target)
     if isempty(hit), t = NaN; else, t = hist.t(hit); end
 end
 
-function r = run_one(X, y, opts)
-%RUN_ONE  Build kernel + solve PG and DCD on (X,y) with given opts. No figure.
-%   Returns r.rho, r.pg (solve_l1l2 out), r.dcd (baseline_dcd_binary out).
-%   Mirrors the main-function block between kernel build and figure.
+function r = run_one(X, y, opts, Kcls)
     opts = fill_default_opts(opts);
+    isMC = strcmp(opts.problem, 'mcsvm');
 
-    meta = struct('task','binary','K',2);
-    P    = make_problem(y, meta, opts);
+    if isMC
+        meta = struct('task','multiclass','K',Kcls);
+    else
+        meta = struct('task','binary','K',2);
+    end
+    P = make_problem(y, meta, opts);
 
-    ker  = make_kernel_op(X, y, P, opts);
-    ker  = augment_kernel_bias(ker, y, P, opts);   % s=0 under 'none' -> no-op
+    ker = make_kernel_op(X, y, P, opts);
+    ker = augment_kernel_bias(ker, y, P, opts);
 
     P.setupGram = ker.gramTime;
     P.setupPG   = ker.gramTime + ker.sig1Time;
+    r.rho       = ker.sig1 / 1.05;          % RBF => max_i K_ii = 1
 
-    % rho on the UNSHIFTED Gram: sig1 carries the 1.05 factor, divide it out.
-    % RBF => max_i K_ii = 1, so rho = sigma_1(K).
-    r.rho = (ker.sig1 / 1.05) / 1;
-
-    r.pg  = solve_l1l2(ker, y, P, opts);
-    r.dcd = baseline_dcd_binary(ker, X, y, P, opts);
-    r.smo = baseline_libsvm_sweep(ker, X, y, P, opts);
+    if isMC
+        r.pg  = solve_mcsvm(ker, y, P, opts);
+        r.dcd = baseline_dcd_mcsvm(ker, X, y, P, opts);
+        r.smo = baseline_smo_mcsvm(ker, X, y, P, opts);   % NOT baseline_libsvm_sweep
+    else
+        r.pg  = solve_l1l2(ker, y, P, opts);
+        r.dcd = baseline_dcd_binary(ker, X, y, P, opts);
+        r.smo = baseline_libsvm_sweep(ker, X, y, P, opts);
+    end
 end
 
 function acc = rbf_test_acc(Xtr, ytr, Xte, yte, alpha, gamma, ~)
@@ -2620,6 +2644,14 @@ function acc = rbf_test_acc(Xtr, ytr, Xte, yte, alpha, gamma, ~)
     score = Kte * coef;                          % no bias under 'none'
     pred  = sign(score);  pred(pred == 0) = 1;
     acc   = mean(pred == yte);
+end
+
+function acc = mc_test_acc(Xtr, ytr, Xte, yte, alpha, gamma)
+    sv = find(any(alpha ~= 0, 2));
+    if isempty(sv), acc = mean(yte == mode(ytr)); return; end
+    S = rbf_gram(Xte, Xtr(sv,:), gamma) * alpha(sv,:);   % nTe x K
+    [~, pred] = max(S, [], 2);
+    acc = mean(pred == yte);
 end
 
 function acc = libsvm_test_acc(Xtr, ytr, Xte, yte, gamma, C)
