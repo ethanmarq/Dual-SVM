@@ -1,14 +1,16 @@
 #!/usr/bin/env sh
 # tba 1 --- # rcv1_binary
-salloc --mem=64gb --cpus-per-task=16 --time=08:00:00
+salloc --mem=192gb --cpus-per-task=32 --time=08:00:00
 module load matlab
 matlab -nodisplay
-data="/scratch/marque6/libsvm_data/rcv1_binary.mat";
+data="/scratch/marque6/libsvm_data/mnist.mat";
+run_svm_comparison(data, struct('problem', 'l2svm','overwrite', true))
 run_svm_comparison(data, struct('problem', 'mcsvm','overwrite', true))
 run_svm_comparison(data, struct('problem', 'nusvm','overwrite', true))
 run_svm_comparison(data, struct('problem', 'svr','overwrite', true))
 run_svm_comparison(data, struct('problem', 'l1svm','overwrite', true))
-run_svm_comparison(data, struct('problem', 'l2svm','overwrite', true))
+exit
+exit
 # tab 2 --- # rcv1_train
 
 data="/scratch/marque6/libsvm_data/rcv1_train.mat";

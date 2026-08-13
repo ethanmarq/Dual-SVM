@@ -227,7 +227,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'problem',  'l2svm');   % l1svm l2svm svr nusvm mcsvm
     opts = set_default(opts, 'costMode', 'none');
     opts = set_default(opts, 'C',        1);
-    opts = set_default(opts, 'nu',       0.1);
+    opts = set_default(opts, 'nu',       0.2);
     opts = set_default(opts, 'epsSVR',   0.1);
 
     % kernel
@@ -246,7 +246,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'lazyRefresh', 500);    % full recompute cadence (FP drift)
     opts = set_default(opts, 'maxIters',    5000);
     opts = set_default(opts, 'tol',         1e-12);
-    opts = set_default(opts, 'timeLimit',   60);
+    opts = set_default(opts, 'timeLimit',   360);
 
     % cost-sensitive weighting
     opts = set_default(opts, 'classCosts',    []);   % per-class multipliers
@@ -703,7 +703,7 @@ function ker = make_kernel_op(X, y, P, opts)
     % end
 
     % ker.sig1Time  = toc(tSig1);
-    optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
+    optsE.tol = 1e-8; optsE.issym = true; optsE.isreal = true;
     s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
     ker.sig1     = 1.05 * abs(s1);
     ker.sig1Time = toc(tSig1);
