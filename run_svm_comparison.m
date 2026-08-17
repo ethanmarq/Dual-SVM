@@ -143,17 +143,23 @@ function results = run_svm_comparison(matFile, opts)
     % ---- reference solvers -----------------------------------------------
     switch P.name
         case 'mcsvm'
-            cand = { baseline_smo_mcsvm(ker, X, y, P, opts),    'CS SMO (max-violating pair)'
-                     baseline_dcd_mcsvm(ker, X, y, P, opts),    'CS sequential dual (Keerthi et al. 2008)' };
+            cand = { baseline_dcd_mcsvm(ker, X, y, P, opts),    'CS sequential dual (Keerthi et al. 2008)' ,
+                    baseline_smo_mcsvm(ker, X, y, P, opts),    'CS SMO (max-violating pair)' };
         case 'nusvm'
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'
-                     baseline_pcd_nusvm(ker, X, y, P, opts),    'Pairwise dual CD (same-class SMO)' };
+              cand = { baseline_pcd_nusvm(ker, X, y, P, opts),    'Pairwise dual CD (same-class SMO)' ,
+                       baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
         case 'svr'
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'
-                     baseline_dcd_svr(ker, X, y, P, opts),      'Kernel dual CD (SVR)' };
+          if opts.biasMode == "none"
+            cand = { baseline_dcd_svr(ker, X, y, P, opts),      'Kernel dual CD (SVR)' };
+          elseif opts.biasMode == "constrained"
+            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'};
+          end
         case {'l1svm', 'l2svm'}
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'
-                     baseline_dcd_binary(ker, X, y, P, opts),   'Kernel dual CD / SOR' };
+          if opts.biasMode == "none"
+            cand = { baseline_dcd_binary(ker, X, y, P, opts),   'Kernel dual CD / SOR' };
+          elseif opts.biasMode == "constrained"
+            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'};
+          end
         otherwise
             cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
     end
@@ -1382,6 +1388,14 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 
     hist = init_hist();
     out  = struct('alpha', [], 'hist', hist, 'skipped', true);
+
+    if ~P.hasEq && any(strcmp(P.name, {'l1svm', 'l2svm', 'svr'}))
+        warning(['baseline_libsvm_sweep: biasMode = ''%s'' puts PG/DCD on the ' ...
+                'box-only dual, but LIBSVM always enforces <alpha,y> = 0. ' ...
+                'f*_eq >= f*_box, so the curves are not comparable. Skipping. ' ...
+                'Use biasMode = ''constrained'' for the matched track.'], opts.biasMode);
+        return;                                  % out.skipped is already true
+    end
 
     if exist('svmtrain', 'file') ~= 3
         warning('LIBSVM mex (svmtrain) not on path; skipping SMO baseline.');
