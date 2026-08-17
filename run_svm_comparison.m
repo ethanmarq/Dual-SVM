@@ -12,10 +12,14 @@ function results = run_svm_comparison(matFile, opts)
 %   FILL_DEFAULT_OPTS for the full list. The options that matter most:
 %
 %       opts.problem     'l1svm' | 'l2svm' | 'nusvm' | 'mcsvm' | 'svr'
-%       opts.kernel      'rbf' (default) | 'linear'
 %       opts.costMode    'none' | 'cost'   (per-class C_i weighting)
-%       opts.biasMode    'constrained' | 'none' | 'augmented'
+%       opts.biasMode    'constrained' | 'none'
 %       opts.timeLimit   solver wall-clock budget, seconds
+%
+%   The kernel is RBF throughout; opts.rbfGamma sets its width. The Gram is
+%   always materialized (n <= opts.explicitKernelMaxN is enforced), because
+%   every coordinate baseline needs cached kernel columns and a matrix-free
+%   matvec was measured 55-63x slower than dense on the benchmarked data.
 %
 %   Every solver is timed on the same clock, which is paused while the
 %   objective is recorded, and which starts pre-charged with the setup cost
@@ -25,18 +29,16 @@ function results = run_svm_comparison(matFile, opts)
 %       The l1/l2/svr duals carry an equality constraint (<alpha,y> = 0 or
 %       1'beta = 0) that comes from the primal bias term b. Single-coordinate
 %       descent cannot move on such a dual, so opts.biasMode selects the
-%       formulation:
+%       formulation -- and with it the TRACK:
 %
-%         'constrained'  keep the equality. PG bisects for the multiplier;
-%                        the coordinate baselines skip themselves.
-%         'none'         no bias at all (LIBLINEAR -B -1, and the setting used
-%                        by Hsieh et al. 2008). Box-only dual, both families
-%                        apply, K is untouched.
-%         'augmented'    penalized bias via a rank-one Gram shift
-%                        Ktilde = K + s^2 v v', s = opts.biasScale. Box-only
-%                        dual. Note sigma_1(Ktilde) ~ sigma_1(K) + s^2 n, so s
-%                        trades model fidelity against conditioning; s = 0 is
-%                        exactly 'none'.
+%         'none'         Track A. No bias at all (LIBLINEAR -B -1, and the
+%                        setting used by Hsieh et al. 2008). Box-only dual:
+%                        PG and the coordinate baselines apply; LIBSVM skips
+%                        itself, since it structurally enforces the equality
+%                        and would solve a different problem (f*_eq >= f*_box).
+%         'constrained'  Track B. Keep the equality. PG bisects for the
+%                        multiplier; the coordinate baselines skip themselves;
+%                        LIBSVM applies.
 %
 %       nusvm is exempt: its two class-mass equalities define nu and cannot be
 %       reformulated away, so its coordinate baseline uses same-class PAIRS.
@@ -46,16 +48,15 @@ function results = run_svm_comparison(matFile, opts)
 %   SETUP ACCOUNTING
 %       ker.gramTime  building K.       Needed by PG and by every coordinate
 %                                       baseline that reads ker.K. Shared.
-%       ker.sig1Time  power iteration.  Needed by PG only -- no coordinate
+%       ker.sig1Time  eigs on ker.mul.  Needed by PG only -- no coordinate
 %                                       method reads ker.sig1.
 %
 %       PG solvers are charged P.setupPG = gramTime + sig1Time.
 %       Coordinate and SMO baselines that read ker.K are charged
 %       P.setupGram = gramTime.
-%       LIBSVM is charged only for kernels it cannot build itself: with -t 0 or
-%       -t 2 it caches internally inside its own timed region (nothing charged);
-%       with -t 4 (l2svm) it needs a precomputed Gram, which is timed and added
-%       to every recorded point.
+%       LIBSVM builds its own kernel cache inside svmtrain (-t 2), so nothing
+%       is pre-charged; with -t 4 (l2svm) it needs a precomputed Gram, which
+%       is timed and added to every recorded point.
 %
 %   REFERENCES
 %       Hsieh, Chang, Lin, Keerthi, Sundararajan (ICML 2008).
@@ -71,7 +72,6 @@ function results = run_svm_comparison(matFile, opts)
 %   See also SOLVE_L1L2, SOLVE_SVR, SOLVE_MCSVM, SOLVE_NUSVM.
 
     addpath('./libsvm-336/matlab');
-    addpath('./liblinear-249/matlab');
 
     if nargin >= 2 && isfield(opts, 'sweepGamma')
         matFile = "/scratch/marque6/libsvm_data/rcv1_binary.mat";
@@ -83,9 +83,6 @@ function results = run_svm_comparison(matFile, opts)
         return;
     end
 
-
-
-
     if nargin < 2
         opts = struct();
     end
@@ -95,7 +92,8 @@ function results = run_svm_comparison(matFile, opts)
     % ---- output path -----------------------------------------------------
     [~, datasetName] = fileparts(matFile);
     figDir  = fullfile(opts.outRoot, datasetName);
-    figPath = fullfile(figDir, sprintf('%s_%s.png', opts.problem, opts.costMode));
+    figPath = fullfile(figDir, sprintf('%s_%s_%s.png', ...
+                       opts.problem, opts.costMode, opts.biasMode));
 
     if exist(figPath, 'file') && ~opts.overwrite
         fprintf('[skip] %s exists (set opts.overwrite = true to redo)\n', figPath);
@@ -111,21 +109,18 @@ function results = run_svm_comparison(matFile, opts)
     [X, y, meta] = preprocess_xy(X, y, opts);
     P            = make_problem(y, meta, opts);
 
-    fprintf('%s | n = %d, d = %d | problem = %s | costMode = %s | C = %g\n', ...
-            datasetName, size(X, 1), size(X, 2), opts.problem, opts.costMode, opts.C);
+    fprintf('%s | n = %d, d = %d | problem = %s | costMode = %s | biasMode = %s | C = %g\n', ...
+            datasetName, size(X, 1), size(X, 2), opts.problem, opts.costMode, ...
+            opts.biasMode, opts.C);
 
     % ---- kernel operator -------------------------------------------------
     ker = make_kernel_op(X, y, P, opts);
-    report_conditioning(ker, X, opts);
-
-    ker = augment_kernel_bias(ker, y, P, opts);
+    report_conditioning(ker);
 
     P.setupGram = ker.gramTime;                   % billed to every ker.K reader
     P.setupPG   = ker.gramTime + ker.sig1Time;    % PG also pays for sigma_1
     fprintf('setup: Gram %.2f s (shared) + sigma_1 %.2f s (PG only)\n', ...
             ker.gramTime, ker.sig1Time);
-
-
 
     % ---- proposed solver -------------------------------------------------
     switch P.name
@@ -141,27 +136,24 @@ function results = run_svm_comparison(matFile, opts)
     propLabel = sprintf('PG Dual (%s)', P.name);
 
     % ---- reference solvers -----------------------------------------------
+    % Flat table per variant. Track routing is done by the guards inside each
+    % baseline: the DCD baselines skip themselves when P.hasEq (Track B), and
+    % baseline_libsvm_sweep skips itself when ~P.hasEq on l1/l2/svr (Track A).
     switch P.name
         case 'mcsvm'
-            cand = { baseline_dcd_mcsvm(ker, X, y, P, opts),    'CS sequential dual (Keerthi et al. 2008)' ,
-                    baseline_smo_mcsvm(ker, X, y, P, opts),    'CS SMO (max-violating pair)' };
+            cand = { baseline_dcd_mcsvm(ker, X, y, P, opts), 'CS sequential dual (Keerthi et al. 2008)'
+                     baseline_smo_mcsvm(ker, X, y, P, opts), 'CS SMO (max-violating pair)' };
         case 'nusvm'
-              cand = { baseline_pcd_nusvm(ker, X, y, P, opts),    'Pairwise dual CD (same-class SMO)' ,
-                       baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
+            cand = { baseline_pcd_nusvm(ker, X, y, P, opts),    'Pairwise dual CD (same-class SMO)'
+                     baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
         case 'svr'
-          if opts.biasMode == "none"
-            cand = { baseline_dcd_svr(ker, X, y, P, opts),      'Kernel dual CD (SVR)' };
-          elseif opts.biasMode == "constrained"
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'};
-          end
+            cand = { baseline_dcd_svr(ker, X, y, P, opts),      'Kernel dual CD (SVR)'
+                     baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
         case {'l1svm', 'l2svm'}
-          if opts.biasMode == "none"
-            cand = { baseline_dcd_binary(ker, X, y, P, opts),   'Kernel dual CD / SOR' };
-          elseif opts.biasMode == "constrained"
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO'};
-          end
+            cand = { baseline_dcd_binary(ker, X, y, P, opts),   'Kernel dual CD / SOR'
+                     baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
         otherwise
-            cand = { baseline_libsvm_sweep(ker, X, y, P, opts), 'LIBSVM SMO' };
+            cand = cell(0, 2);
     end
 
     baseOuts   = {};
@@ -179,7 +171,8 @@ function results = run_svm_comparison(matFile, opts)
 
     % ---- figure ----------------------------------------------------------
     if opts.makeFigure
-        ttl = sprintf('%s: %s (%s)', datasetName, P.name, opts.costMode);
+        ttl = sprintf('%s: %s (%s, bias=%s)', datasetName, P.name, ...
+                      opts.costMode, opts.biasMode);
         make_config_figure(hists, labels, figPath, ttl, 'Dual suboptimality  f - f*');
         fprintf('Saved %s\n', figPath);
     end
@@ -189,6 +182,7 @@ function results = run_svm_comparison(matFile, opts)
     results.figPath  = figPath;
     results.problem  = P.name;
     results.costMode = opts.costMode;
+    results.biasMode = opts.biasMode;
     results.proposed = propOut;
     results.baseline = baseOuts;     % cell array, aligned with labels(2:end)
     results.labels   = labels;
@@ -197,24 +191,17 @@ function results = run_svm_comparison(matFile, opts)
 end
 
 
-function report_conditioning(ker, X, opts)
+function report_conditioning(ker)
 %REPORT_CONDITIONING  Print sigma_1(K) / max_i K_ii.
 %
 %   The projected-gradient step is 1/sigma_1(K); the exact coordinate step is
 %   1/K_ii. This ratio is therefore the per-coordinate handicap the global
-%   Lipschitz constant imposes, and it predicts which family wins. Report it
-%   before any bias shift is applied, so it describes the true Gram.
+%   Lipschitz constant imposes, and it predicts which family wins.
 %
-%   Note ker.sig1 carries a 1.05 safety factor from the power iteration; it is
-%   divided out here so the printed value is the actual spectral radius.
+%   Note ker.sig1 carries a 1.05 safety factor; it is divided out here so the
+%   printed value is the actual spectral radius.
 
-    if ker.explicit
-        maxKii = max(full(diag(ker.K)));
-    elseif strcmp(opts.kernel, 'linear')
-        maxKii = max(full(sum(X .^ 2, 2)));
-    else
-        maxKii = 1;                              % RBF: k(x, x) = exp(0) = 1
-    end
+    maxKii = max(full(diag(ker.K)));             % RBF: identically 1
 
     sig1 = ker.sig1 / 1.05;
     fprintf('sigma_1(K) = %.4e | max_i K_ii = %.4e | ratio = %.2f\n', ...
@@ -236,15 +223,14 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'nu',       0.2);
     opts = set_default(opts, 'epsSVR',   0.1);
 
-    % kernel
-    opts = set_default(opts, 'kernel',   'rbf');     % 'linear' | 'rbf'
+    % kernel (RBF throughout)
     opts = set_default(opts, 'rbfGamma', 2.5);       % k = exp(-g||x - x'||^2),
                                                      % g = 1/(2r^2), radius 1
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
 
     % bias handling (see the header of run_svm_comparison)
-    opts = set_default(opts, 'biasMode',  'none');   % 'constrained' | 'none' | 'augmented'
-    opts = set_default(opts, 'biasScale', 1);        % s in Ktilde = K + s^2 v v'
+    opts = set_default(opts, 'biasMode', 'none');    % 'none' (Track A) |
+                                                     % 'constrained' (Track B)
 
     % proximal solver
     opts = set_default(opts, 'accel',       true);
@@ -269,7 +255,6 @@ function opts = fill_default_opts(opts)
 
     % baselines
     opts = set_default(opts, 'smoTolerances', 10 .^ -(1:8));
-    opts = set_default(opts, 'liblinearFn',   'train');
 
     % reporting
     opts = set_default(opts, 'outRoot',    '.');
@@ -291,13 +276,9 @@ function opts = fill_default_opts(opts)
         error('opts.costMode must be ''none'' or ''cost''.');
     end
 
-    valid = {'constrained', 'augmented', 'none'};
+    valid = {'constrained', 'none'};
     if ~any(strcmp(opts.biasMode, valid))
-        error('opts.biasMode must be ''constrained'', ''augmented'', or ''none''.');
-    end
-
-    if strcmp(opts.biasMode, 'none')
-        opts.biasScale = 0;      % zero shift == bias-free dual (LIBLINEAR -B -1)
+        error('opts.biasMode must be ''constrained'' or ''none''.');
     end
 end
 
@@ -490,7 +471,9 @@ function [X, y, meta] = preprocess_xy(X, y, opts)
 
     % ---- standardize -----------------------------------------------------
     % Sparse input is only scaled, never centred: subtracting the mean would
-    % destroy sparsity and blow up memory.
+    % destroy sparsity and blow up memory. NOTE: for already L2-normalized
+    % text features (e.g. rcv1) this inflates pairwise distances and collapses
+    % the RBF off-diagonals; keep standardize = false there.
     if opts.standardize
         if issparse(X)
             colScale = full(sqrt(sum(X .^ 2, 1) / max(1, size(X, 1))));
@@ -556,9 +539,10 @@ function P = make_problem(y, meta, opts)
 
     withCost = strcmp(opts.costMode, 'cost');
 
-    % P.hasEq is read only by solve_l1l2, solve_svr, baseline_dcd_binary and
-    % baseline_dcd_svr. It means "the dual carries a bias equality that the
-    % projection must enforce" -- not "the dual has any equality at all".
+    % P.hasEq is read only by solve_l1l2, solve_svr, baseline_dcd_binary,
+    % baseline_dcd_svr and baseline_libsvm_sweep. It means "the dual carries a
+    % bias equality that the projection must enforce" -- not "the dual has any
+    % equality at all".
     P.hasEq = strcmp(opts.biasMode, 'constrained');
     if any(strcmp(P.name, {'nusvm', 'mcsvm'}))
         % nusvm: two coupled class-mass equalities; they define nu and no bias
@@ -639,76 +623,52 @@ end
 %  ======================================================================
 
 function ker = make_kernel_op(X, y, P, opts)
-%MAKE_KERNEL_OP  Build K*a, sigma_1(K), and (when affordable) K itself.
+%MAKE_KERNEL_OP  Build the RBF Gram, K*a, and sigma_1(K).
 %
 %   Returns
 %       ker.mul       @(a) -> K*a. Accepts n x 1 and n x K right-hand sides.
-%       ker.explicit  is ker.K materialized?
-%       ker.K         the n x n Gram (explicit mode only)
-%       ker.sig1      1.05 * lambda_max(K), capped at n for RBF
+%       ker.K         the n x n Gram
+%       ker.sig1      1.05 * lambda_max(K)
 %       ker.gramTime  seconds spent building K       (shared cost)
 %       ker.sig1Time  seconds spent on sigma_1       (PG-only cost)
 %
 %   For l1svm/l2svm/nusvm the Gram is SIGNED: K = (y y') .* Kraw. Callers that
 %   index ker.K must account for that.
 %
-%   Every coordinate baseline needs kernel COLUMNS, so they require
-%   ker.explicit. In practice that caps n in the low thousands for RBF, since a
-%   dense n x n double is 8n^2 bytes.
+%   The Gram is always materialized: every coordinate baseline needs kernel
+%   COLUMNS, and a matrix-free RBF matvec was measured 55-63x slower than
+%   dense. n > opts.explicitKernelMaxN is therefore a hard error, raised here,
+%   before the 8n^2-byte allocation is attempted.
 
-    n      = size(X, 1);
+    n = size(X, 1);
+
+    if n > opts.explicitKernelMaxN
+        error(['make_kernel_op: n = %d > opts.explicitKernelMaxN = %d. The ', ...
+               'benchmark requires the cached %d x %d Gram (%.1f GB). ', ...
+               'Subsample via opts.maxSamples, or raise the threshold if ', ...
+               'memory allows.'], n, opts.explicitKernelMaxN, n, n, 8 * n^2 / 1e9);
+    end
+
     signed = any(strcmp(P.name, {'l1svm', 'l2svm', 'nusvm'}));
-    isRbf  = strcmp(opts.kernel, 'rbf');
 
     % ---- Gram ------------------------------------------------------------
     tGram = tic;
 
-    if n <= opts.explicitKernelMaxN
-        if isRbf
-            K = rbf_gram(X, X, opts.rbfGamma);
-        else
-            K = full(X * X');
-        end
-        if signed
-            K = (y * y') .* K;
-        end
-        ker.mul      = @(a) K * a;
-        ker.explicit = true;
-        ker.K        = K;
-
-    elseif isRbf
-        warning('n = %d > explicitKernelMaxN: RBF K*a computed in blocks (slow).', n);
-        if signed
-            ker.mul = @(a) y .* rbf_mul_blocked(X, opts.rbfGamma, y .* a);
-        else
-            ker.mul = @(a) rbf_mul_blocked(X, opts.rbfGamma, a);
-        end
-        ker.explicit = false;
-
-    else
-        Xt = X';                                  % cache the transpose once
-        if signed
-            ker.mul = @(a) y .* (X * (Xt * (y .* a)));
-        else
-            ker.mul = @(a) X * (Xt * a);
-        end
-        ker.explicit = false;
+    K = rbf_gram(X, X, opts.rbfGamma);
+    if signed
+        % Two-pass row/column scaling == (y*y').*K without the n x n dense
+        % outer-product temporary (which doubles peak memory at this size).
+        K = K .* y;
+        K = K .* y.';
     end
+    ker.mul      = @(a) K * a;
+    ker.explicit = true;
+    ker.K        = K;
 
     ker.gramTime = toc(tGram);
 
     % ---- sigma_1 ---------------------------------------------------------
     tSig1 = tic;
-
-    % % Every PG solver uses adaptive backtracking, so we just need a
-    % % reasonable lower bound to start the local Lipschitz estimate.
-    % if ker.explicit
-    %     ker.sig1 = max(full(diag(ker.K)));
-    % else
-    %     ker.sig1 = 1;
-    % end
-
-    % ker.sig1Time  = toc(tSig1);
     optsE.tol = 1e-8; optsE.issym = true; optsE.isreal = true;
     s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
     ker.sig1     = 1.05 * abs(s1);
@@ -730,172 +690,17 @@ function K = rbf_gram(A, B, gamma)
 end
 
 
-function out = rbf_mul_blocked(X, gamma, a)
-%RBF_MUL_BLOCKED  K*a for the RBF kernel without materializing K.
-%
-%   Rows are processed in blocks of roughly 1 GB of doubles. Accepts n x 1 and
-%   n x K right-hand sides.
-%
-%   Sparse `a` -- which is what the lazy delta updates hand us -- takes a fast
-%   path: the Gram is formed only against the support of a, so the cost is
-%   O(n |supp(a)| d) rather than O(n^2 d).
-
-    n = size(X, 1);
-
-    if issparse(a)
-        idx = find(any(a ~= 0, 2));
-        if isempty(idx)
-            out = zeros(n, size(a, 2));
-            return;
-        end
-
-        Xs  = X(idx, :);
-        af  = full(a(idx, :));
-        blk = max(256, floor(1.25e8 / max(1, numel(idx))));
-        out = zeros(n, size(a, 2));
-        for i0 = 1:blk:n
-            ii = i0:min(i0 + blk - 1, n);
-            out(ii, :) = rbf_gram(X(ii, :), Xs, gamma) * af;
-        end
-        return;
-    end
-
-    blk = max(256, floor(1.25e8 / n));
-    out = zeros(n, size(a, 2));
-    for i0 = 1:blk:n
-        ii = i0:min(i0 + blk - 1, n);
-        out(ii, :) = rbf_gram(X(ii, :), X, gamma) * a;
-    end
-end
-
-
-function ker = augment_kernel_bias(ker, y, P, opts)
-%AUGMENT_KERNEL_BIAS  Rank-one Gram shift for the penalized-bias dual.
-%
-%   Appending a constant feature s to phi(x) is impossible for an RBF map, but
-%   its effect on the Gram is not: it is the rank-one shift
-%
-%       Ktilde = K + s^2 v v',    Ktilde_ii = K_ii + s^2
-%
-%   with v = y for the signed problems and v = 1 for svr. The bias is then
-%   regularized as (1/2)(b/s)^2, the dual equality vanishes, and the feasible
-%   set becomes a pure box -- which is exactly what single-coordinate descent
-%   needs.
-%
-%   The shift is rank one and is never materialized: it is folded into ker.mul
-%   (and into kacc.col / kacc.diag by dcd_kernel_ops) at O(n) extra cost per
-%   matvec. sigma_1 is recomputed for the shifted operator, because solve_l1l2
-%   reads ker.sig1 for its step size and a stale value would let it overstep.
-%
-%   Scale matters. lambda_max(s^2 v v') = s^2 ||v||^2 = s^2 n, so
-%   sigma_1(Ktilde) ~ sigma_1(K) + s^2 n. On a well-conditioned Gram, s = 1 can
-%   make the shift the entire Lipschitz constant -- crippling the PG step while
-%   barely touching the coordinate step (K_ii goes from 1 to 1 + s^2). Sweeping
-%   s is therefore a clean way to walk the conditioning ratio from sigma_1(K)
-%   up to n on fixed data. s = 0 is exactly biasMode 'none'.
-
-    ker.b2 = 0;
-    ker.bv = [];
-
-    % mcsvm has no bias term. nusvm has two coupled class-mass equalities that a
-    % bias shift does not remove, so shifting K while solve_nusvm still projects
-    % onto them would silently solve a different problem.
-    if any(strcmp(P.name, {'mcsvm', 'nusvm'}))
-        return;
-    end
-    if ~any(strcmp(opts.biasMode, {'augmented', 'none'}))
-        return;                                   % 'constrained': keep the equality
-    end
-
-    s2 = opts.biasScale ^ 2;
-    if s2 == 0
-        fprintf('biasMode = none: bias-free dual, no shift, sigma_1(K) = %.4e\n', ker.sig1);
-        return;                                   % ker.sig1 is already correct
-    end
-
-    n = numel(y);
-    if any(strcmp(P.name, {'l1svm', 'l2svm'}))
-        v = y(:);                                 % signed Gram
-    else
-        v = ones(n, 1);                           % unsigned (svr)
-    end
-
-    baseMul = ker.mul;
-    ker.mul = @(a) baseMul(a) + s2 * (v * (v' * a));   % rank one; n x K safe
-    ker.b2  = s2;
-    ker.bv  = v;
-
-    tSig1 = tic;
-    % ker.sig1     = max(full(diag(ker.K))) + s2;   % RBF: K_ii=1, v_i^2=1
-    % ker.sig1Time = ker.sig1Time + 0;
-    % tSig1 = tic;
-    optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
-    s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
-    ker.sig1     = 1.05 * abs(s1);          % keep the safety factor (see below)
-    ker.sig1Time = toc(tSig1);
-        ker.setupTime = ker.gramTime + ker.sig1Time;
-
-    fprintf(['biasMode = augmented: rank-one shift s^2 = %.4g applied; ', ...
-             'equality dropped, sigma_1(Ktilde) = %.4e\n'], s2, ker.sig1);
-end
-
-
-function kacc = dcd_kernel_ops(ker, X, y, P, opts)   %#ok<INUSL>
+function kacc = dcd_kernel_ops(ker)
 %DCD_KERNEL_OPS  Column / diagonal access for the coordinate methods.
 %
-%   kacc.mode   'explicit'  Gram cached. A coordinate gradient is one column
-%                           lookup, O(n). This is the mode to use.
-%               'linear'    No Gram, but a linear kernel, so maintain
-%                           w = X'(y .* a) and read the gradient in O(nnz(x_i)).
-%               'blocked'   RBF, no Gram. Every coordinate would need a fresh
-%                           kernel column, O(nd), making an epoch O(n^2 d).
-%                           Callers skip themselves in this mode rather than
-%                           report a meaningless wall-clock number.
+%   The Gram is always cached (make_kernel_op enforces it), so a coordinate
+%   gradient is one column lookup, O(n).
 %
-%   kacc.diag   n x 1, diag(Ktilde)
-%   kacc.col    @(i) -> Ktilde(:, i)          (explicit mode only)
-%   kacc.b2     rank-one bias shift magnitude (0 if none)
-%   kacc.bv     rank-one bias shift vector    ([] if none)
-%
-%   Note kacc.mode is derived from ker.explicit AND opts.kernel; it is not a
-%   restatement of opts.kernel. A linear kernel on small n gives 'explicit',
-%   because a cached column beats the w-trick.
+%   kacc.diag   n x 1, diag(K)
+%   kacc.col    @(i) -> K(:, i)
 
-    n  = numel(y);
-    b2 = 0;
-    bv = [];
-    if isfield(ker, 'b2') && ~isempty(ker.b2)
-        b2 = ker.b2;
-        bv = ker.bv;
-    end
-
-    kacc = struct('b2', b2, 'bv', bv);
-
-    if ker.explicit
-        kacc.mode = 'explicit';
-        kacc.diag = full(diag(ker.K));
-        if b2 > 0
-            kacc.diag = kacc.diag + b2 * (bv .^ 2);
-            kacc.col  = @(i) ker.K(:, i) + (b2 * bv(i)) * bv;
-        else
-            kacc.col  = @(i) ker.K(:, i);
-        end
-
-    elseif strcmp(opts.kernel, 'linear')
-        kacc.mode = 'linear';
-        kacc.diag = full(sum(X .^ 2, 2));
-        if b2 > 0
-            kacc.diag = kacc.diag + b2 * (bv .^ 2);
-        end
-        kacc.col = [];
-
-    else
-        kacc.mode = 'blocked';
-        kacc.diag = ones(n, 1);                   % RBF: k(x, x) = 1
-        kacc.col  = [];
-    end
-
-    kacc.diag = max(kacc.diag, 1e-12);
+    kacc.diag = max(full(diag(ker.K)), 1e-12);
+    kacc.col  = @(i) ker.K(:, i);
 end
 
 
@@ -949,8 +754,8 @@ function out = solve_l1l2(ker, y, P, opts)
 %       find lambda with  sum_i y_i clip(beta_i - lambda y_i) = 0   (bisection)
 %       a    <- clip(beta - lambda y)
 %
-%   Under biasMode 'none'/'augmented' the equality is gone, lambda = 0, and the
-%   projection collapses to a clip.
+%   Under biasMode 'none' the equality is gone, lambda = 0, and the projection
+%   collapses to a clip.
 
     n    = numel(y);
     isL2 = strcmp(P.name, 'l2svm');
@@ -1372,8 +1177,8 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 %   traced by re-training at each tolerance in opts.smoTolerances and recording
 %   (training time, dual objective) for each.
 %
-%   Timing. With -t 0 / -t 2 LIBSVM builds its own kernel cache inside svmtrain,
-%   so the recorded time is exactly what it spends and nothing is pre-charged.
+%   Timing. With -t 2 LIBSVM builds its own kernel cache inside svmtrain, so
+%   the recorded time is exactly what it spends and nothing is pre-charged.
 %   With -t 4 (l2svm) it needs a precomputed Gram that we must build for it;
 %   that build is timed and added to every recorded point, since LIBSVM cannot
 %   run without it.
@@ -1404,12 +1209,7 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 
     n       = size(X, 1);
     useKtil = false;
-
-    if strcmp(opts.kernel, 'rbf')
-        kpart = sprintf('-t 2 -g %.10g', opts.rbfGamma);   % matched gamma
-    else
-        kpart = '-t 0';
-    end
+    kpart   = sprintf('-t 2 -g %.10g', opts.rbfGamma);   % matched gamma
 
     switch P.name
         case 'l1svm'
@@ -1421,12 +1221,6 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
             end
 
         case 'l2svm'
-            if n > opts.explicitKernelMaxN
-                warning(['l2svm SMO baseline needs the explicit %d x %d kernel ', ...
-                         '(> opts.explicitKernelMaxN = %d); skipping.'], ...
-                         n, n, opts.explicitKernelMaxN);
-                return;
-            end
             base    = sprintf('-s 0 -t 4 -c %.10g', 1e10 * max(P.Ci));
             useKtil = true;
 
@@ -1452,12 +1246,8 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
     % ---- kernel preparation (charged only when LIBSVM cannot do it) -------
     setupCost = 0;
     if useKtil
-        tKtr = tic;
-        if strcmp(opts.kernel, 'rbf')
-            Ktr = [(1:n)', rbf_gram(X, X, opts.rbfGamma) + diag(1 ./ P.Ci)];
-        else
-            Ktr = [(1:n)', full(X * X') + diag(1 ./ P.Ci)];
-        end
+        tKtr      = tic;
+        Ktr       = [(1:n)', rbf_gram(X, X, opts.rbfGamma) + diag(1 ./ P.Ci)];
         setupCost = toc(tKtr);
     else
         Xsp = sparse(X);                          % format conversion only
@@ -1544,7 +1334,7 @@ function out = baseline_libsvm_sweep(ker, X, y, P, opts)
 end
 
 
-function out = baseline_smo_mcsvm(ker, X, y, P, opts)
+function out = baseline_smo_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
 %BASELINE_SMO_MCSVM  Kernelized Crammer-Singer SMO.
 %
 %   Maximal-violating-pair working set (two classes within one example) and an
@@ -1566,14 +1356,7 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)
     UP  = E .* CiK;                               % [0, C_i] at the true class
     LO  = (E - 1) .* CiK;                         % [-C_i, 0] elsewhere
 
-    if ker.explicit
-        Kdiag = full(diag(ker.K));
-    elseif strcmp(opts.kernel, 'rbf')
-        Kdiag = ones(n, 1);                       % exp(0) = 1
-    else
-        Kdiag = full(sum(X .^ 2, 2));
-    end
-    Kdiag = max(Kdiag, 1e-12);
+    Kdiag = max(full(diag(ker.K)), 1e-12);
 
     alpha = zeros(n, K);
     KA    = zeros(n, K);                          % maintained K*alpha (= scores)
@@ -1613,11 +1396,7 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)
         alpha(i, u) = alpha(i, u) + t;
         alpha(i, v) = alpha(i, v) - t;
 
-        if ker.explicit
-            Ki = ker.K(:, i);
-        else
-            Ki = ker.mul(sparse(i, 1, 1, n, 1));  % K(:, i) via one matvec
-        end
+        Ki = ker.K(:, i);
         KA(:, u) = KA(:, u) + t * Ki;             % only two columns move
         KA(:, v) = KA(:, v) - t * Ki;
 
@@ -1661,16 +1440,14 @@ end
 %      nusvm                  2 coords, same class two class-mass equalities
 %  ======================================================================
 
-function out = baseline_dcd_binary(ker, X, y, P, opts)
+function out = baseline_dcd_binary(ker, X, y, P, opts)   %#ok<INUSL>
 %BASELINE_DCD_BINARY  Kernel SOR / kernel-adatron for L1-/L2-SVM.
 %
 %   Mangasarian & Musicant (1999); Friess et al. (1998). Equivalently, Hsieh et
 %   al. (2008) Algorithm 3 -- random permutation plus shrinking -- with a kernel
-%   gradient in place of the linear w-trick. (That trick maintains
-%   w = sum_i y_i a_i x_i to read grad_i in O(nnz(x_i)); there is no w for an
-%   RBF map, so a cached Gram column at O(n) is the best available.)
+%   gradient (a cached Gram column at O(n)) in place of the linear w-trick.
 %
-%   Dual (box-only; requires biasMode 'none' or 'augmented'):
+%   Dual (box-only; requires biasMode 'none'):
 %       l1svm:  f(a) = 0.5 a'Ka - 1'a                      0 <= a_i <= C_i
 %       l2svm:  f(a) = 0.5 a'Ka + 0.5 sum(a^2/C_i) - 1'a   a_i >= 0
 %
@@ -1692,23 +1469,14 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
     if ~isfield(P, 'hasEq') || P.hasEq
         warning(['baseline_dcd_binary: the dual still carries <alpha,y> = 0, on ', ...
                  'which a single-coordinate move is infeasible. Set opts.biasMode ', ...
-                 'to ''none'' or ''augmented'' to put both solvers on the box-only ', ...
-                 'dual. Skipping.']);
+                 'to ''none'' to put both solvers on the box-only dual. Skipping.']);
         return;
     end
 
-    kacc = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(kacc.mode, 'blocked')
-        warning(['baseline_dcd_binary: RBF with no cached Gram. Every coordinate ', ...
-                 'would need a fresh kernel column (O(nd)), making an epoch ', ...
-                 'O(n^2 d) -- not a meaningful wall-clock number. Raise ', ...
-                 'opts.explicitKernelMaxN above n = %d. Skipping.'], numel(y));
-        return;
-    end
+    kacc = dcd_kernel_ops(ker);
 
-    n      = numel(y);
-    isL2   = strcmp(P.name, 'l2svm');
-    linear = strcmp(kacc.mode, 'linear');
+    n    = numel(y);
+    isL2 = strcmp(P.name, 'l2svm');
 
     if isL2
         U    = inf(n, 1);
@@ -1719,15 +1487,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
     end
 
     alpha = zeros(n, 1);
-    g     = zeros(n, 1);                 % g = Ktilde*alpha  (alpha = 0 -> 0)
-
-    if linear
-        Xa = X;
-        if kacc.b2 > 0
-            Xa = [X, opts.biasScale * ones(n, 1)];   % constant feature == the shift
-        end
-        w = zeros(size(Xa, 2), 1);       % w = Xa' * (y .* alpha)
-    end
+    g     = zeros(n, 1);                 % g = K*alpha  (alpha = 0 -> 0)
 
     % Shrinking state (Hsieh et al. Alg. 3).
     A    = (1:n)';
@@ -1755,16 +1515,10 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
             i     = A(s);
             steps = steps + 1;
 
-            if linear
-                gi = y(i) * (Xa(i, :) * w);
-            else
-                gi = g(i);
-            end
-
             if isL2
-                G = gi + alpha(i) / P.Ci(i) - 1;
+                G = g(i) + alpha(i) / P.Ci(i) - 1;
             else
-                G = gi - 1;
+                G = g(i) - 1;
             end
 
             % ---- shrink test, then projected gradient ---------------------
@@ -1796,20 +1550,13 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
                 delta    = alpha(i) - aOld;
 
                 if delta ~= 0
-                    if linear
-                        w = w + (delta * y(i)) * Xa(i, :)';   % O(nnz(x_i))
-                    else
-                        g = g + delta * kacc.col(i);          % O(n), cached column
-                    end
+                    g = g + delta * kacc.col(i);          % O(n), cached column
                 end
             end
 
             % ---- record / time gate --------------------------------------
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
-                if linear
-                    g = y .* (Xa * w);   % off-clock; keeps the objective exact
-                end
+                clk  = clk_pause(clk);
                 f    = plotted_objective(P, alpha, g, y);
                 hist = rec_hist(hist, clk.solve, f);
                 maybe_print(opts, 'dcd', steps, f);
@@ -1845,10 +1592,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
         if m >= 0, mbar = -inf; else, mbar = m; end
     end
 
-    clk = clk_pause(clk);
-    if linear
-        g = y .* (Xa * w);
-    end
+    clk  = clk_pause(clk);
     hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
 
     out.alpha   = alpha;
@@ -1857,12 +1601,12 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)
 end
 
 
-function out = baseline_dcd_svr(ker, X, y, P, opts)
+function out = baseline_dcd_svr(ker, X, y, P, opts)   %#ok<INUSL>
 %BASELINE_DCD_SVR  Coordinate descent for the eps-insensitive SVR dual.
 %
 %   Kernel form of Ho & Lin (2012) / LIBLINEAR -s 11..13.
 %
-%   Dual (box-only; requires biasMode 'none' or 'augmented'):
+%   Dual (box-only; requires biasMode 'none'):
 %       f(b) = 0.5 b'Kb - y'b + eps ||b||_1,   bLo_i <= b_i <= bUp_i
 %
 %   The one-variable subproblem picks up the l1 term:
@@ -1882,33 +1626,19 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
 
     if ~isfield(P, 'hasEq') || P.hasEq
         warning(['baseline_dcd_svr: the dual still carries 1''beta = 0. Set ', ...
-                 'opts.biasMode to ''none'' or ''augmented'' to compare on the ', ...
-                 'box-only dual that coordinate descent actually solves. Skipping.']);
+                 'opts.biasMode to ''none'' to compare on the box-only dual ', ...
+                 'that coordinate descent actually solves. Skipping.']);
         return;
     end
 
-    kacc = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(kacc.mode, 'blocked')
-        warning(['baseline_dcd_svr: RBF with no cached Gram -> O(n^2 d) per epoch. ', ...
-                 'Raise opts.explicitKernelMaxN. Skipping.']);
-        return;
-    end
+    kacc = dcd_kernel_ops(ker);
 
     n      = numel(y);
     epsIns = P.eps;
-    linear = strcmp(kacc.mode, 'linear');
     Kii    = kacc.diag;
 
     b = zeros(n, 1);
-    g = zeros(n, 1);                     % g = Ktilde*b
-
-    if linear
-        Xa = X;
-        if kacc.b2 > 0
-            Xa = [X, opts.biasScale * ones(n, 1)];
-        end
-        w = zeros(size(Xa, 2), 1);       % w = Xa' * b
-    end
+    g = zeros(n, 1);                     % g = K*b
 
     A    = (1:n)';
     Mbar =  inf;
@@ -1935,13 +1665,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
             i     = A(s);
             steps = steps + 1;
 
-            if linear
-                gi = Xa(i, :) * w;
-            else
-                gi = g(i);
-            end
-
-            G  = gi - y(i);              % smooth part of the gradient
+            G  = g(i) - y(i);            % smooth part of the gradient
             bi = b(i);
 
             % ---- projected gradient of the NONSMOOTH objective ------------
@@ -1984,19 +1708,12 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
 
                 if delta ~= 0
                     b(i) = bNew;
-                    if linear
-                        w = w + delta * Xa(i, :)';
-                    else
-                        g = g + delta * kacc.col(i);
-                    end
+                    g    = g + delta * kacc.col(i);
                 end
             end
 
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
-                if linear
-                    g = Xa * w;
-                end
+                clk  = clk_pause(clk);
                 f    = plotted_objective(P, b, g, y);
                 hist = rec_hist(hist, clk.solve, f);
                 maybe_print(opts, 'dcd-svr', steps, f);
@@ -2028,10 +1745,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
         if m >= 0, mbar = -inf; else, mbar = m; end
     end
 
-    clk = clk_pause(clk);
-    if linear
-        g = Xa * w;
-    end
+    clk  = clk_pause(clk);
     hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y));
 
     out.alpha   = b;
@@ -2040,7 +1754,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)
 end
 
 
-function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
+function out = baseline_dcd_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
 %BASELINE_DCD_MCSVM  Crammer-Singer sequential dual (Keerthi et al. 2008).
 %
 %   Needs no bias reformulation: Crammer-Singer has no bias term, and its
@@ -2069,13 +1783,7 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
         return;
     end
 
-    kacc = dcd_kernel_ops(ker, X, y, P, opts);
-    if strcmp(kacc.mode, 'blocked')
-        warning(['baseline_dcd_mcsvm: RBF with no cached Gram -> a kernel column ', ...
-                 'per row. Raise opts.explicitKernelMaxN above n = %d. Skipping.'], ...
-                 numel(y));
-        return;
-    end
+    kacc = dcd_kernel_ops(ker);
 
     n = numel(y);
     K = P.K;
@@ -2085,14 +1793,10 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
     UP  = E .* CiK;                               % [0, C_i] at the true class
     LO  = (E - 1) .* CiK;                         % [-C_i, 0] elsewhere
 
-    linear = strcmp(kacc.mode, 'linear');
-    Kii    = kacc.diag;
+    Kii = kacc.diag;
 
     alpha = zeros(n, K);
     KA    = zeros(n, K);                          % maintained K*alpha
-    if linear
-        W = zeros(size(X, 2), K);                 % W = X'*alpha  (d x K)
-    end
 
     A = (1:n)';                                   % active rows
 
@@ -2115,11 +1819,7 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
             i     = A(s);
             steps = steps + 1;
 
-            if linear
-                gi = X(i, :) * W;                 % 1 x K
-            else
-                gi = KA(i, :);
-            end
+            gi = KA(i, :);
 
             % Exact block minimizer: the capped-simplex projection, stepped by
             % 1/K_ii rather than 1/sigma_1(K).
@@ -2134,19 +1834,11 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
             else
                 maxViol     = max(maxViol, viol);
                 alpha(i, :) = aNew;
-
-                if linear
-                    W  = W  + X(i, :)' * dRow;    % O(nnz(x_i) K)
-                else
-                    KA = KA + kacc.col(i) * dRow; % O(nK)
-                end
+                KA          = KA + kacc.col(i) * dRow;   % O(nK)
             end
 
             if mod(steps, chkEvery) == 0
-                clk = clk_pause(clk);
-                if linear
-                    KA = X * W;
-                end
+                clk  = clk_pause(clk);
                 f    = plotted_objective(P, alpha, KA, y);
                 hist = rec_hist(hist, clk.solve, f);
                 maybe_print(opts, 'dcd-cs', steps, f);
@@ -2173,10 +1865,7 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)
         end
     end
 
-    clk = clk_pause(clk);
-    if linear
-        KA = X * W;
-    end
+    clk  = clk_pause(clk);
     hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
 
     out.alpha   = alpha;
@@ -2198,8 +1887,7 @@ function out = baseline_pcd_nusvm(ker, X, y, P, opts)   %#ok<INUSL>
 %   Two coupled equalities, and they are NOT bias constraints -- they define nu.
 %   Drop them and a = 0 is optimal, because there is nothing to push against. So
 %   unlike l1/l2/svr, no reformulation makes a single-coordinate move feasible:
-%   changing one a_i breaks its class sum. This is why augment_kernel_bias
-%   refuses nusvm.
+%   changing one a_i breaks its class sum.
 %
 %   The smallest feasible move is a same-class PAIR: a_i += t, a_j -= t with
 %   y_i = y_j. Both class sums are preserved, and so is <a, y> = 0. Along
@@ -2222,16 +1910,6 @@ function out = baseline_pcd_nusvm(ker, X, y, P, opts)   %#ok<INUSL>
     out  = struct('alpha', [], 'hist', hist, 'skipped', true);
 
     if ~strcmp(P.name, 'nusvm')
-        return;
-    end
-
-    % A pair step needs two kernel COLUMNS and the single ENTRY K_ij. Even a
-    % linear kernel has no w-trick that yields K_ij cheaply, so a cached Gram is
-    % required in every kernel mode.
-    if ~ker.explicit
-        warning(['baseline_pcd_nusvm: a pair step needs kernel columns and the ', ...
-                 'entry K_ij, so a cached Gram is required. Raise ', ...
-                 'opts.explicitKernelMaxN above n = %d. Skipping.'], numel(y));
         return;
     end
 
@@ -2528,16 +2206,14 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     title(strrep(ttl, '_', '\_'));
     legend('Location', 'best');
     saveas(fig, figPath);
-    legend('Location', 'best');
-    saveas(fig, figPath);
     close(fig);
 end
 
 function results = gamma_sweep(matFile, opts0)
 %GAMMA_SWEEP  Walk rho = sigma_1(K)/max_i K_ii down via rbfGamma, on the
-%   UNMODIFIED box-only dual (biasMode='none', s=0), and time PG vs DCD to a
-%   fixed suboptimality target. Prints gamma | rho | PG-time | DCD-time |
-%   test-acc | winner. rho is measured, not set; gamma is the only knob moved.
+%   UNMODIFIED box-only dual (biasMode='none'), and time PG vs DCD to a fixed
+%   suboptimality target. Prints gamma | rho | PG-time | DCD-time | test-acc |
+%   winner. rho is measured, not set; gamma is the only knob moved.
     gammas = opts0.sweepGamma(:)';
     target = 1e-6;
 
@@ -2570,8 +2246,7 @@ function results = gamma_sweep(matFile, opts0)
         o = opts0;
         o = rmfield(o, 'sweepGamma');       % avoid re-dispatch into this fn
         o.problem   = prob;
-        o.kernel    = 'rbf';
-        o.biasMode  = 'none';               % s forced to 0 -> true problem
+        o.biasMode  = 'none';               % box-only dual -> true problem
         o.rbfGamma  = g;
         o.makeFigure = false;
         o.overwrite  = true;
@@ -2628,7 +2303,6 @@ function r = run_one(X, y, opts, Kcls)
     P = make_problem(y, meta, opts);
 
     ker = make_kernel_op(X, y, P, opts);
-    ker = augment_kernel_bias(ker, y, P, opts);
 
     P.setupGram = ker.gramTime;
     P.setupPG   = ker.gramTime + ker.sig1Time;
@@ -2725,7 +2399,7 @@ function results = cv_gamma_sweep(matFile, opts0)
             foldAcc(f) = mean(pred == yall(teI));
         end
         accMean(gi) = mean(foldAcc);
-        rho = gamma_rho(Xall, yall, g);
+        rho = gamma_rho(Xall, g);
         fprintf(' %5.2f | %7.2f |     %5.1f +/- %4.1f\n', ...
                 g, rho, 100*mean(foldAcc), 100*std(foldAcc));
     end
@@ -2736,12 +2410,10 @@ function results = cv_gamma_sweep(matFile, opts0)
 end
 
 
-function rho = gamma_rho(X, y, gamma)   %#ok<INUSL>
-    fprintf('   [gamma_rho: gamma=%g, size(X)=%dx%d]\n', gamma, size(X,1), size(X,2));
+function rho = gamma_rho(X, gamma)
+%GAMMA_RHO  Measured sigma_1(K)/max_i K_ii for one gamma (no safety factor).
     K = rbf_gram(X, X, gamma);
-    fprintf('   [K(1,2)=%.4g, max offdiag row1=%.4g]\n', K(1,2), max(K(1,2:end)));
     optsE.tol = 1e-3; optsE.issym = true; optsE.isreal = true;
-    s1 = eigs(@(a) K*a, size(K,1), 1, 'largestabs', optsE);
+    s1  = eigs(@(a) K*a, size(K,1), 1, 'largestabs', optsE);
     rho = abs(s1) / max(full(diag(K)));
-    fprintf('   [sig1=%.4g, maxdiag=%.4g, rho=%.4g]\n', abs(s1), max(full(diag(K))), rho);
 end
