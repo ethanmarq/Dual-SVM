@@ -58,6 +58,20 @@ function results = run_svm_comparison(matFile, opts)
 %       is pre-charged; with -t 4 (l2svm) it needs a precomputed Gram, which
 %       is timed and added to every recorded point.
 %
+%   COST AXIS (machine-independent)
+%       Alongside wall-clock, every instrumented history records hist.cols:
+%       cumulative kernel-column reads weighted by right-hand-side width.
+%       One coordinate update = 1, a pair step = 2, an mcsvm row update = K,
+%       a dense matvec K*a = n, K*A with an n x K RHS = nK, a sparse-delta
+%       matvec = nnz(delta), and each eigs matvec = n. Dividing by the cost
+%       of one full gradient (n, or nK for mcsvm) gives gradient equivalents,
+%       under which one coordinate epoch == one matvec by construction.
+%       LIBSVM is a black box, so its cols are NaN. The unit ignores memory
+%       locality: BLAS streams a matvec while a coordinate epoch scatters n
+%       separate column reads, so this axis flatters the coordinate methods
+%       exactly as wall-clock flatters PG -- the two bracket the
+%       implementation-independent answer.
+%
 %   REFERENCES
 %       Hsieh, Chang, Lin, Keerthi, Sundararajan (ICML 2008).
 %           A dual coordinate descent method for large-scale linear SVM.
@@ -119,6 +133,8 @@ function results = run_svm_comparison(matFile, opts)
 
     P.setupGram = ker.gramTime;                   % billed to every ker.K reader
     P.setupPG   = ker.gramTime + ker.sig1Time;    % PG also pays for sigma_1
+    P.setupGramCols = ker.gramCols;               % same split, in column units
+    P.setupPGCols   = ker.gramCols + ker.sig1Cols;
     fprintf('setup: Gram %.2f s (shared) + sigma_1 %.2f s (PG only)\n', ...
             ker.gramTime, ker.sig1Time);
 
@@ -534,8 +550,10 @@ function P = make_problem(y, meta, opts)
     P.nu        = opts.nu;
     P.eps       = opts.epsSVR;
     P.K         = meta.K;
-    P.setupGram = 0;
-    P.setupPG   = 0;
+    P.setupGram     = 0;
+    P.setupPG       = 0;
+    P.setupGramCols = 0;
+    P.setupPGCols   = 0;
 
     withCost = strcmp(opts.costMode, 'cost');
 
@@ -670,13 +688,27 @@ function ker = make_kernel_op(X, y, P, opts)
     % ---- sigma_1 ---------------------------------------------------------
     tSig1 = tic;
     optsE.tol = 1e-8; optsE.issym = true; optsE.isreal = true;
-    s1 = eigs(ker.mul, n, 1, 'largestabs', optsE);
+    counted_mul([], ker.mul, 'reset');
+    s1  = eigs(@(x) counted_mul(x, ker.mul, 'mul'), n, 1, 'largestabs', optsE);
+    nmv = counted_mul([], ker.mul, 'get');
     ker.sig1     = 1.05 * abs(s1);
     ker.sig1Time = toc(tSig1);
+    ker.gramCols = n;                             % n columns formed
+    ker.sig1Cols = nmv * n;                       % eigs matvecs, n cols each
     ker.setupTime = ker.gramTime + ker.sig1Time;
 end
 
 
+function y = counted_mul(x, mulfun, mode)
+%COUNTED_MUL  ker.mul wrapper that counts matvecs (for the eigs setup charge).
+%   'reset' zeroes the counter, 'get' returns it, 'mul' applies and counts.
+    persistent cnt
+    switch mode
+        case 'reset', cnt = 0; y = [];
+        case 'get',   y = cnt;
+        otherwise,    cnt = cnt + 1; y = mulfun(x);
+    end
+end
 function K = rbf_gram(A, B, gamma)
 %RBF_GRAM  k(a, b) = exp(-gamma ||a - b||^2).
 %
@@ -775,6 +807,7 @@ function out = solve_l1l2(ker, y, P, opts)
 
     hist = init_hist();
     clk  = clk_new(P.setupPG);
+    cols = P.setupPGCols;            % kernel-column units (see header)
 
     it = 0;
     while it < opts.maxIters
@@ -790,7 +823,7 @@ function out = solve_l1l2(ker, y, P, opts)
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
             f    = plotted_objective(P, alpha, ga, y);   % free: ga is maintained
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, P.name, it, f);
         end
         stop = clk.solve >= opts.timeLimit;
@@ -842,9 +875,11 @@ function out = solve_l1l2(ker, y, P, opts)
         gaPrev       = ga;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
-            ga = ga + ker.mul(sparse(dA));
+            ga   = ga + ker.mul(sparse(dA));
+            cols = cols + nnz(dA);
         else
-            ga           = ker.mul(alphaNew);    % periodic full refresh
+            ga           = ker.mul(alphaNew);
+            cols         = cols + n;    % periodic full refresh
             sinceRefresh = 0;
         end
         gz = ga + theta * (ga - gaPrev);
@@ -856,7 +891,7 @@ function out = solve_l1l2(ker, y, P, opts)
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y), cols);
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -887,6 +922,7 @@ function out = solve_svr(ker, y, P, opts)
 
     hist = init_hist();
     clk  = clk_new(P.setupPG);
+    cols = P.setupPGCols;            % kernel-column units (see header)
 
     it = 0;
     while it < opts.maxIters
@@ -895,7 +931,7 @@ function out = solve_svr(ker, y, P, opts)
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
             f    = plotted_objective(P, b, gb, y);
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, P.name, it, f);
         end
         stop = clk.solve >= opts.timeLimit;
@@ -933,9 +969,11 @@ function out = solve_svr(ker, y, P, opts)
         gbPrev       = gb;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dB) < 0.5 * n
-            gb = gb + ker.mul(sparse(dB));
+            gb   = gb + ker.mul(sparse(dB));
+            cols = cols + nnz(dB);
         else
             gb           = ker.mul(bNew);
+            cols         = cols + n;
             sinceRefresh = 0;
         end
         gz = gb + theta * (gb - gbPrev);
@@ -947,7 +985,7 @@ function out = solve_svr(ker, y, P, opts)
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, ker.mul(b), y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, ker.mul(b), y), cols);
 
     out = struct('alpha', b, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -987,6 +1025,7 @@ function out = solve_mcsvm(ker, y, P, opts)
 
     hist = init_hist();
     clk  = clk_new(P.setupPG);
+    cols = P.setupPGCols;            % kernel-column units (see header)
 
     it = 0;
     while it < opts.maxIters
@@ -995,7 +1034,7 @@ function out = solve_mcsvm(ker, y, P, opts)
         clk = clk_pause(clk);
         if mod(it - 1, opts.evalEvery) == 0
             f    = plotted_objective(P, alpha, GA, y);   % free: GA is maintained
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, P.name, it, f);
         end
         stop = clk.solve >= opts.timeLimit;
@@ -1042,9 +1081,11 @@ function out = solve_mcsvm(ker, y, P, opts)
         GAPrev       = GA;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * numel(dA)
-            GA = GA + ker.mul(sparse(dA));
+            GA   = GA + ker.mul(sparse(dA));
+            cols = cols + nnz(dA);
         else
             GA           = ker.mul(alphaNew);
+            cols         = cols + n * K;
             sinceRefresh = 0;
         end
         GZ = GA + theta * (GA - GAPrev);
@@ -1056,7 +1097,7 @@ function out = solve_mcsvm(ker, y, P, opts)
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y), cols);
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -1088,6 +1129,7 @@ function out = solve_nusvm(ker, y, P, opts)
 
     hist = init_hist();
     clk  = clk_new(P.setupPG);
+    cols = P.setupPGCols;            % kernel-column units (see header)
 
     it = 0;
     while it < opts.maxIters
@@ -1099,7 +1141,7 @@ function out = solve_nusvm(ker, y, P, opts)
         % iterate is feasible, i.e. after the first projection.
         if it > 1 && mod(it - 1, opts.evalEvery) == 0
             f    = plotted_objective(P, alpha, ga, y);
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, P.name, it, f);
         end
         stop = clk.solve >= opts.timeLimit;
@@ -1145,9 +1187,11 @@ function out = solve_nusvm(ker, y, P, opts)
         gaPrev       = ga;
 
         if opts.lazy && sinceRefresh < opts.lazyRefresh && nnz(dA) < 0.5 * n
-            ga = ga + ker.mul(sparse(dA));
+            ga   = ga + ker.mul(sparse(dA));
+            cols = cols + nnz(dA);
         else
             ga           = ker.mul(a);
+            cols         = cols + n;
             sinceRefresh = 0;
         end
         gz = ga + theta * (ga - gaPrev);
@@ -1159,7 +1203,7 @@ function out = solve_nusvm(ker, y, P, opts)
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, ker.mul(alpha), y), cols);
 
     out = struct('alpha', alpha, 'hist', hist, 'iters', it, 'skipped', false);
 end
@@ -1363,7 +1407,8 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
     epsB  = 1e-12;                                % box-activity tolerance
 
     clk  = clk_new(P.setupGram);                  % reads ker.K columns
-    hist = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, KA, y));
+    cols = P.setupGramCols;
+    hist = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, KA, y), cols);
 
     chkEvery = max(1, n);                         % record cadence ~ one epoch
     maxSteps = opts.maxIters * max(1, n);
@@ -1399,12 +1444,13 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
         Ki = ker.K(:, i);
         KA(:, u) = KA(:, u) + t * Ki;             % only two columns move
         KA(:, v) = KA(:, v) - t * Ki;
+        cols     = cols + 2;                      % one column read, 2-wide use
 
         % ---- record / time gate ------------------------------------------
         if mod(s, chkEvery) == 0
             clk  = clk_pause(clk);
             f    = plotted_objective(P, alpha, KA, y);
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, 'smo-cs', s, f);
             stop = clk.solve >= opts.timeLimit;
             clk  = clk_resume(clk);
@@ -1415,7 +1461,7 @@ function out = baseline_smo_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y), cols);
 
     out.alpha = alpha;
     out.hist  = hist;
@@ -1495,7 +1541,8 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)   %#ok<INUSL>
     mbar = -inf;
 
     clk      = clk_new(P.setupGram);
-    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, g, y));
+    cols     = P.setupGramCols;
+    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, g, y), cols);
     chkEvery = max(1, ceil(n / 8));      % sub-epoch recording; epochs are long
 
     ep     = 0;
@@ -1550,7 +1597,8 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)   %#ok<INUSL>
                 delta    = alpha(i) - aOld;
 
                 if delta ~= 0
-                    g = g + delta * kacc.col(i);          % O(n), cached column
+                    g    = g + delta * kacc.col(i);       % O(n), cached column
+                    cols = cols + 1;
                 end
             end
 
@@ -1558,7 +1606,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)   %#ok<INUSL>
             if mod(steps, chkEvery) == 0
                 clk  = clk_pause(clk);
                 f    = plotted_objective(P, alpha, g, y);
-                hist = rec_hist(hist, clk.solve, f);
+                hist = rec_hist(hist, clk.solve, f, cols);
                 maybe_print(opts, 'dcd', steps, f);
 
                 timeUp = clk.solve >= opts.timeLimit;
@@ -1593,7 +1641,7 @@ function out = baseline_dcd_binary(ker, X, y, P, opts)   %#ok<INUSL>
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y), cols);
 
     out.alpha   = alpha;
     out.hist    = hist;
@@ -1645,7 +1693,8 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)   %#ok<INUSL>
     mbar = -inf;
 
     clk      = clk_new(P.setupGram);
-    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, b, g, y));
+    cols     = P.setupGramCols;
+    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, b, g, y), cols);
     chkEvery = max(1, ceil(n / 8));
 
     ep     = 0;
@@ -1709,13 +1758,14 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)   %#ok<INUSL>
                 if delta ~= 0
                     b(i) = bNew;
                     g    = g + delta * kacc.col(i);
+                    cols = cols + 1;
                 end
             end
 
             if mod(steps, chkEvery) == 0
                 clk  = clk_pause(clk);
                 f    = plotted_objective(P, b, g, y);
-                hist = rec_hist(hist, clk.solve, f);
+                hist = rec_hist(hist, clk.solve, f, cols);
                 maybe_print(opts, 'dcd-svr', steps, f);
 
                 timeUp = clk.solve >= opts.timeLimit;
@@ -1746,7 +1796,7 @@ function out = baseline_dcd_svr(ker, X, y, P, opts)   %#ok<INUSL>
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, b, g, y), cols);
 
     out.alpha   = b;
     out.hist    = hist;
@@ -1801,7 +1851,8 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
     A = (1:n)';                                   % active rows
 
     clk      = clk_new(P.setupGram);
-    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, KA, y));
+    cols     = P.setupGramCols;
+    hist     = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, KA, y), cols);
     chkEvery = max(1, ceil(n / 8));
 
     ep     = 0;
@@ -1835,12 +1886,13 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
                 maxViol     = max(maxViol, viol);
                 alpha(i, :) = aNew;
                 KA          = KA + kacc.col(i) * dRow;   % O(nK)
+                cols        = cols + K;          % one column against a 1 x K RHS
             end
 
             if mod(steps, chkEvery) == 0
                 clk  = clk_pause(clk);
                 f    = plotted_objective(P, alpha, KA, y);
-                hist = rec_hist(hist, clk.solve, f);
+                hist = rec_hist(hist, clk.solve, f, cols);
                 maybe_print(opts, 'dcd-cs', steps, f);
 
                 timeUp = clk.solve >= opts.timeLimit;
@@ -1866,7 +1918,7 @@ function out = baseline_dcd_mcsvm(ker, X, y, P, opts)   %#ok<INUSL>
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, KA, y), cols);
 
     out.alpha   = alpha;
     out.hist    = hist;
@@ -1935,7 +1987,8 @@ function out = baseline_pcd_nusvm(ker, X, y, P, opts)   %#ok<INUSL>
 
     clk  = clk_new(P.setupGram);
     g    = ker.mul(alpha);                        % g = K*alpha, maintained below
-    hist = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, g, y));
+    cols = P.setupGramCols + n;                   % feasible-start image
+    hist = rec_hist(hist, P.setupGram, plotted_objective(P, alpha, g, y), cols);
 
     epsB     = 1e-12;                             % box-activity tolerance
     chkEvery = max(1, n);                         % record cadence ~ one epoch
@@ -2002,12 +2055,13 @@ function out = baseline_pcd_nusvm(ker, X, y, P, opts)   %#ok<INUSL>
         alpha(i) = alpha(i) + t;
         alpha(j) = alpha(j) - t;
         g        = g + t * (Ki - Kj);             % O(n)
+        cols     = cols + 2;                      % two column reads
 
         % ---- record / time gate ------------------------------------------
         if mod(s, chkEvery) == 0
             clk  = clk_pause(clk);
             f    = plotted_objective(P, alpha, g, y);
-            hist = rec_hist(hist, clk.solve, f);
+            hist = rec_hist(hist, clk.solve, f, cols);
             maybe_print(opts, 'pcd-nu', s, f);
             stop = clk.solve >= opts.timeLimit;
             clk  = clk_resume(clk);
@@ -2018,7 +2072,7 @@ function out = baseline_pcd_nusvm(ker, X, y, P, opts)   %#ok<INUSL>
     end
 
     clk  = clk_pause(clk);
-    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y));
+    hist = rec_hist(hist, clk.solve, plotted_objective(P, alpha, g, y), cols);
 
     out.alpha   = alpha;
     out.hist    = hist;
@@ -2147,13 +2201,17 @@ end
 
 
 function hist = init_hist()
-    hist = struct('t', [], 'f', []);
+    hist = struct('t', [], 'f', [], 'cols', []);
 end
 
 
-function hist = rec_hist(hist, t, f)
-    hist.t(end+1, 1) = t;
-    hist.f(end+1, 1) = f;
+function hist = rec_hist(hist, t, f, cols)
+    if nargin < 4
+        cols = NaN;                      % un-instrumented recorder (LIBSVM)
+    end
+    hist.t(end+1, 1)    = t;
+    hist.f(end+1, 1)    = f;
+    hist.cols(end+1, 1) = cols;
 end
 
 
@@ -2238,8 +2296,8 @@ function results = gamma_sweep(matFile, opts0)
     nTr = round(0.8*nAll);
     trI = perm(1:nTr); teI = perm(nTr+1:end);
 
-    fprintf('\n gamma |     rho |  PG (s) | DCD (s) | SMO (s) | acc%% | libAcc%% | winner\n');
-    fprintf('-------+---------+---------+---------+---------+------+---------+--------\n');
+    fprintf('\n gamma |     rho |  PG (s) | DCD (s) | SMO (s) |  PG mv | DCD mv | acc%% | libAcc%% | winner\n');
+    fprintf('-------+---------+---------+---------+---------+--------+--------+------+---------+--------\n');
 
     rows = [];
     for g = gammas
@@ -2260,6 +2318,12 @@ function results = gamma_sweep(matFile, opts0)
         tDCD = time_to_target(r.dcd.hist, target);
         tSMO = time_to_target(r.smo.hist, target);
 
+        % Machine-independent twin of the wall-clock crossover: gradient
+        % equivalents to the same target (one full gradient = n, or nK).
+        if isMC, denom = size(Xtr, 1) * Kcls; else, denom = size(Xtr, 1); end
+        mvPG  = cols_to_target(r.pg.hist,  target) / denom;
+        mvDCD = cols_to_target(r.dcd.hist, target) / denom;
+
         if isMC
             acc = mc_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g);
         else
@@ -2275,9 +2339,10 @@ function results = gamma_sweep(matFile, opts0)
         else, [~,wi] = min(cand); win = names{wi};
         end
 
-        fprintf(' %5.2f | %7.2f | %7s | %7s | %7s | %4.1f | %5.1f | %s\n', ...
-            g, r.rho, fmt(tPG), fmt(tDCD), fmt(tSMO), 100*acc, 100*lacc, win);
-        rows = [rows; g, r.rho, tPG, tDCD, acc]; %#ok<AGROW>
+        fprintf(' %5.2f | %7.2f | %7s | %7s | %7s | %6s | %6s | %4.1f | %5.1f | %s\n', ...
+            g, r.rho, fmt(tPG), fmt(tDCD), fmt(tSMO), fmt(mvPG), fmt(mvDCD), ...
+            100*acc, 100*lacc, win);
+        rows = [rows; g, r.rho, tPG, tDCD, mvPG, mvDCD, acc]; %#ok<AGROW>
     end
     results = struct('gammas', gammas, 'table', rows);
 end
@@ -2291,6 +2356,17 @@ function t = time_to_target(hist, target)
     if isempty(hit), t = NaN; else, t = hist.t(hit); end
 end
 
+function c = cols_to_target(hist, target)
+%COLS_TO_TARGET  Kernel-column units at which f - f* first <= target.
+%   NaN when the history is un-instrumented (LIBSVM) or never reaches target.
+    fstar = min(hist.f);
+    hit   = find(hist.f - fstar <= target, 1, 'first');
+    if isempty(hit)
+        c = NaN;
+    else
+        c = hist.cols(hit);
+    end
+end
 function r = run_one(X, y, opts, Kcls)
     opts = fill_default_opts(opts);
     isMC = strcmp(opts.problem, 'mcsvm');
