@@ -245,7 +245,7 @@ function opts = fill_default_opts(opts)
     opts = set_default(opts, 'explicitKernelMaxN', 80000);
 
     % bias handling (see the header of run_svm_comparison)
-    opts = set_default(opts, 'biasMode', 'none');    % 'none' (Track A) |
+    opts = set_default(opts, 'biasMode', 'constrained');    % 'none' (Track A) |
                                                      % 'constrained' (Track B)
 
     % proximal solver
@@ -640,7 +640,7 @@ end
 %  Kernel operator
 %  ======================================================================
 
-function ker = make_kernel_op(X, y, P, opts)
+function ker = make_kernel_op(X, y, P, opts, pre)
 %MAKE_KERNEL_OP  Build the RBF Gram, K*a, and sigma_1(K).
 %
 %   Returns
@@ -650,6 +650,15 @@ function ker = make_kernel_op(X, y, P, opts)
 %       ker.gramTime  seconds spent building K       (shared cost)
 %       ker.sig1Time  seconds spent on sigma_1       (PG-only cost)
 %
+%   PRE (optional) supplies a cached gamma-invariant distance matrix:
+%       pre.D2        n x n squared distances from SQ_DISTS
+%       pre.d2Time    seconds that build cost
+%   When supplied, the Gram is exp(-gamma*D2) and pre.d2Time is ADDED to
+%   ker.gramTime. That re-charge matters: gramTime is pre-charged to every
+%   solver clock via P.setupGram / P.setupPG, so amortizing the distance
+%   build across a sweep must not make the sweep's setup look cheaper than
+%   the same run standing alone. Callers that omit PRE are unaffected.
+%
 %   For l1svm/l2svm/nusvm the Gram is SIGNED: K = (y y') .* Kraw. Callers that
 %   index ker.K must account for that.
 %
@@ -657,6 +666,10 @@ function ker = make_kernel_op(X, y, P, opts)
 %   COLUMNS, and a matrix-free RBF matvec was measured 55-63x slower than
 %   dense. n > opts.explicitKernelMaxN is therefore a hard error, raised here,
 %   before the 8n^2-byte allocation is attempted.
+
+    if nargin < 5
+        pre = [];
+    end
 
     n = size(X, 1);
 
@@ -670,9 +683,24 @@ function ker = make_kernel_op(X, y, P, opts)
     signed = any(strcmp(P.name, {'l1svm', 'l2svm', 'nusvm'}));
 
     % ---- Gram ------------------------------------------------------------
-    tGram = tic;
+    tGram    = tic;
+    d2Charge = 0;
 
-    K = rbf_gram(X, X, opts.rbfGamma);
+    if isempty(pre)
+        K = rbf_gram(X, X, opts.rbfGamma);
+    else
+        % Blocked exp so the n x n intermediate (-gamma*D2) is never
+        % materialized in full: peak stays at D2 + K + one column block
+        % rather than D2 + K + a third n x n array.
+        K   = zeros(n, n);
+        blk = 2048;
+        for j0 = 1:blk:n
+            j1 = min(j0 + blk - 1, n);
+            K(:, j0:j1) = exp(-opts.rbfGamma * pre.D2(:, j0:j1));
+        end
+        d2Charge = pre.d2Time;
+    end
+
     if signed
         % Two-pass row/column scaling == (y*y').*K without the n x n dense
         % outer-product temporary (which doubles peak memory at this size).
@@ -683,7 +711,7 @@ function ker = make_kernel_op(X, y, P, opts)
     ker.explicit = true;
     ker.K        = K;
 
-    ker.gramTime = toc(tGram);
+    ker.gramTime = toc(tGram) + d2Charge;
 
     % ---- sigma_1 ---------------------------------------------------------
     tSig1 = tic;
@@ -709,18 +737,31 @@ function y = counted_mul(x, mulfun, mode)
         otherwise,    cnt = cnt + 1; y = mulfun(x);
     end
 end
+
 function K = rbf_gram(A, B, gamma)
 %RBF_GRAM  k(a, b) = exp(-gamma ||a - b||^2).
 %
 %   gamma = 1/(2 radius^2) matches LIBSVM's -g convention, so radius 1 is
 %   gamma 0.5.
 
+    K = exp(-gamma * sq_dists(A, B));
+end
+
+function D2 = sq_dists(A, B)
+%SQ_DISTS  Pairwise squared Euclidean distances, ||a - b||^2.
+%
+%   Gamma-invariant, which is the whole reason it is a separate function:
+%   gamma_sweep builds this once and reuses it across the sweep, since the
+%   only gamma-dependent step is the elementwise exp.
+%
+%   The negative round-off clamp is applied here, once, rather than on every
+%   kernel build.
+
     sqA = full(sum(A .^ 2, 2));
     sqB = full(sum(B .^ 2, 2));
     D2  = bsxfun(@plus, sqA, sqB') - 2 * full(A * B');
-    K   = exp(-gamma * max(D2, 0));               % clamp negative round-off
+    D2  = max(D2, 0);                             % clamp negative round-off
 end
-
 
 function kacc = dcd_kernel_ops(ker)
 %DCD_KERNEL_OPS  Column / diagonal access for the coordinate methods.
@@ -2264,6 +2305,8 @@ function make_config_figure(hists, labels, figPath, ttl, ylab)
     title(strrep(ttl, '_', '\_'));
     legend('Location', 'best');
     saveas(fig, figPath);
+    legend('Location', 'best');
+    saveas(fig, figPath);
     close(fig);
 end
 
@@ -2272,6 +2315,11 @@ function results = gamma_sweep(matFile, opts0)
 %   UNMODIFIED box-only dual (biasMode='none'), and time PG vs DCD to a fixed
 %   suboptimality target. Prints gamma | rho | PG-time | DCD-time | test-acc |
 %   winner. rho is measured, not set; gamma is the only knob moved.
+%
+%   The squared-distance matrix is gamma-invariant and is built once here,
+%   then reused for every gamma; see MAKE_KERNEL_OP for how its cost is
+%   re-charged so the timings stay comparable to a standalone run.
+
     gammas = opts0.sweepGamma(:)';
     target = 1e-6;
 
@@ -2283,6 +2331,11 @@ function results = gamma_sweep(matFile, opts0)
     end
     isMC = strcmp(prob, 'mcsvm');
 
+    sweep_log('gamma_sweep: %s\n', matFile);
+    sweep_log('  problem = %s | gammas = [%s] | target = %.0e\n', ...
+              prob, strtrim(sprintf('%g ', gammas)), target);
+
+    tLoad = tic;
     [Xall, yraw] = load_xy_from_mat(matFile);
     if isMC
         [classes, ~, yall] = unique(yraw);   % yall in 1..K
@@ -2291,16 +2344,37 @@ function results = gamma_sweep(matFile, opts0)
         yall = sign(yraw); yall(yall==0) = 1;
         Kcls = 2;
     end
+    sweep_log('  loaded n = %d, d = %d, K = %d in %.2f s\n', ...
+              size(Xall,1), size(Xall,2), Kcls, toc(tLoad));
 
     rng(1); nAll = size(Xall,1); perm = randperm(nAll);
     nTr = round(0.8*nAll);
     trI = perm(1:nTr); teI = perm(nTr+1:end);
 
-    fprintf('\n gamma |     rho |  PG (s) | DCD (s) | SMO (s) |  PG mv | DCD mv | acc%% | libAcc%% | winner\n');
-    fprintf('-------+---------+---------+---------+---------+--------+--------+------+---------+--------\n');
+    % The split does not depend on gamma either, so hoist it with D2.
+    Xtr = Xall(trI,:);  ytr = yall(trI);
+    Xte = Xall(teI,:);  yte = yall(teI);
 
-    rows = [];
+    % ---- gamma-invariant distance matrix, built ONCE ----------------------
+    % Previously make_kernel_op recomputed full(X*X') and its n x n
+    % temporaries for every gamma. On sparse text features that product is
+    % the dominant setup cost and it is identical across the sweep.
+    tD2 = tic;
+    pre = struct('D2', sq_dists(Xtr, Xtr), 'd2Time', 0);
+    pre.d2Time = toc(tD2);
+    sweep_log('  squared distances %d x %d cached in %.2f s (%.1f GB resident)\n', ...
+              size(pre.D2,1), size(pre.D2,2), pre.d2Time, 8*numel(pre.D2)/1e9);
+
+    hdr1 = ' gamma |     rho |  PG (s) | DCD (s) | SMO (s) |  PG mv | DCD mv | acc%% | libAcc%% | winner\n';
+    hdr2 = '-------+---------+---------+---------+---------+--------+--------+------+---------+--------\n';
+    sweep_log(['\n' hdr1]);
+    sweep_log(hdr2);
+
+    rows     = [];
+    rowLines = {};
     for g = gammas
+        sweep_log('\n[gamma = %.2f]\n', g);
+
         o = opts0;
         o = rmfield(o, 'sweepGamma');       % avoid re-dispatch into this fn
         o.problem   = prob;
@@ -2311,8 +2385,7 @@ function results = gamma_sweep(matFile, opts0)
         o.verbose    = false;
 
         % Run the real pipeline on the TRAIN split only.
-        Xtr = Xall(trI,:); ytr = yall(trI);
-        r    = run_one(Xtr, ytr, o, Kcls);
+        r = run_one(Xtr, ytr, o, Kcls, pre);
 
         tPG  = time_to_target(r.pg.hist,  target);
         tDCD = time_to_target(r.dcd.hist, target);
@@ -2324,13 +2397,17 @@ function results = gamma_sweep(matFile, opts0)
         mvPG  = cols_to_target(r.pg.hist,  target) / denom;
         mvDCD = cols_to_target(r.dcd.hist, target) / denom;
 
+        t0 = tic;
         if isMC
-            acc = mc_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g);
+            acc = mc_test_acc(Xtr, ytr, Xte, yte, r.pg.alpha, g);
         else
-            acc = rbf_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), r.pg.alpha, g, o.C);
+            acc = rbf_test_acc(Xtr, ytr, Xte, yte, r.pg.alpha, g, o.C);
         end
+        sweep_log('         acc  %8.2f s -> %.1f%%\n', toc(t0), 100*acc);
 
-        lacc = libsvm_test_acc(Xtr, ytr, Xall(teI,:), yall(teI), g, o.C);
+        t0 = tic;
+        lacc = libsvm_test_acc(Xtr, ytr, Xte, yte, g, o.C);
+        sweep_log('         ref  %8.2f s -> %.1f%% (LIBSVM, uncapped)\n', toc(t0), 100*lacc);
 
         % winner across all three
         cand = [tPG tDCD tSMO];
@@ -2339,13 +2416,104 @@ function results = gamma_sweep(matFile, opts0)
         else, [~,wi] = min(cand); win = names{wi};
         end
 
-        fprintf(' %5.2f | %7.2f | %7s | %7s | %7s | %6s | %6s | %4.1f | %5.1f | %s\n', ...
+        rowStr = sprintf(' %5.2f | %7.2f | %7s | %7s | %7s | %6s | %6s | %4.1f | %5.1f | %s\n', ...
             g, r.rho, fmt(tPG), fmt(tDCD), fmt(tSMO), fmt(mvPG), fmt(mvDCD), ...
             100*acc, 100*lacc, win);
-        rows = [rows; g, r.rho, tPG, tDCD, mvPG, mvDCD, acc]; %#ok<AGROW>
+        sweep_log('%s', rowStr);
+
+        rows     = [rows; g, r.rho, tPG, tDCD, mvPG, mvDCD, acc]; %#ok<AGROW>
+        rowLines{end+1} = rowStr;                                 %#ok<AGROW>
     end
+
+    % ---- clean reprint, now that the progress lines have broken up the table
+    sweep_log('\n==== gamma_sweep summary ====\n');
+    sweep_log(hdr1);
+    sweep_log(hdr2);
+    for i = 1:numel(rowLines)
+        sweep_log('%s', rowLines{i});
+    end
+
     results = struct('gammas', gammas, 'table', rows);
 end
+
+function r = run_one(X, y, opts, Kcls, pre)
+%RUN_ONE  One gamma of the sweep: build the kernel, run PG / DCD / SMO.
+%
+%   PRE is the optional cached distance matrix; see MAKE_KERNEL_OP.
+%
+%   Each stage is timed and logged on completion. These wall-clock numbers
+%   are diagnostic only -- the reported crossover still comes from
+%   TIME_TO_TARGET on the recorded histories, which exclude objective
+%   evaluation and include the setup charge.
+
+    if nargin < 5
+        pre = [];
+    end
+
+    opts = fill_default_opts(opts);
+    isMC = strcmp(opts.problem, 'mcsvm');
+
+    if isMC
+        meta = struct('task','multiclass','K',Kcls);
+    else
+        meta = struct('task','binary','K',2);
+    end
+    P = make_problem(y, meta, opts);
+
+    ker = make_kernel_op(X, y, P, opts, pre);
+
+    P.setupGram = ker.gramTime;
+    P.setupPG   = ker.gramTime + ker.sig1Time;
+
+    % These two were missing: make_problem leaves them at 0, so every sweep
+    % row reported gradient equivalents WITHOUT the setup charge that the
+    % main run_svm_comparison path includes. The wall-clock and column axes
+    % were not measuring the same thing.
+    P.setupGramCols = ker.gramCols;
+    P.setupPGCols   = ker.gramCols + ker.sig1Cols;
+
+    r.rho   = ker.sig1 / 1.05;                    % RBF => max_i K_ii = 1
+    r.tGram = ker.gramTime;
+    r.tSig1 = ker.sig1Time;
+
+    sweep_log('         Gram %8.2f s | sigma_1 %7.2f s | rho %8.2f\n', ...
+              ker.gramTime, ker.sig1Time, r.rho);
+
+    if isMC
+        t0 = tic;  r.pg  = solve_mcsvm(ker, y, P, opts);              r.tPG  = toc(t0);
+        sweep_log('         PG   %8.2f s (%d iters)\n', r.tPG, r.pg.iters);
+
+        t0 = tic;  r.dcd = baseline_dcd_mcsvm(ker, X, y, P, opts);    r.tDCD = toc(t0);
+        sweep_log('         DCD  %8.2f s\n', r.tDCD);
+
+        t0 = tic;  r.smo = baseline_smo_mcsvm(ker, X, y, P, opts);    r.tSMO = toc(t0);
+        sweep_log('         SMO  %8.2f s\n', r.tSMO);
+    else
+        t0 = tic;  r.pg  = solve_l1l2(ker, y, P, opts);               r.tPG  = toc(t0);
+        sweep_log('         PG   %8.2f s (%d iters)\n', r.tPG, r.pg.iters);
+
+        t0 = tic;  r.dcd = baseline_dcd_binary(ker, X, y, P, opts);   r.tDCD = toc(t0);
+        sweep_log('         DCD  %8.2f s\n', r.tDCD);
+
+        t0 = tic;  r.smo = baseline_libsvm_sweep(ker, X, y, P, opts); r.tSMO = toc(t0);
+        sweep_log('         SMO  %8.2f s\n', r.tSMO);
+    end
+end
+
+function sweep_log(varargin)
+%SWEEP_LOG  Progress line for gamma_sweep / run_one, flushed as it is written.
+%
+%   gamma_sweep sets opts.verbose = false to silence the per-iteration solver
+%   prints, which left the sweep silent for the full duration of a row. These
+%   lines are the replacement: they are stage-level, not iteration-level, so
+%   they stay quiet but make a long run distinguishable from a hung one.
+
+    fprintf(varargin{:});
+    if usejava('desktop')
+        drawnow('limitrate');                     % force the desktop to flush
+    end
+end
+
 
 function s = fmt(t); if isnan(t), s='  ---'; else, s=sprintf('%.2f',t); end; end
 
@@ -2365,33 +2533,6 @@ function c = cols_to_target(hist, target)
         c = NaN;
     else
         c = hist.cols(hit);
-    end
-end
-function r = run_one(X, y, opts, Kcls)
-    opts = fill_default_opts(opts);
-    isMC = strcmp(opts.problem, 'mcsvm');
-
-    if isMC
-        meta = struct('task','multiclass','K',Kcls);
-    else
-        meta = struct('task','binary','K',2);
-    end
-    P = make_problem(y, meta, opts);
-
-    ker = make_kernel_op(X, y, P, opts);
-
-    P.setupGram = ker.gramTime;
-    P.setupPG   = ker.gramTime + ker.sig1Time;
-    r.rho       = ker.sig1 / 1.05;          % RBF => max_i K_ii = 1
-
-    if isMC
-        r.pg  = solve_mcsvm(ker, y, P, opts);
-        r.dcd = baseline_dcd_mcsvm(ker, X, y, P, opts);
-        r.smo = baseline_smo_mcsvm(ker, X, y, P, opts);   % NOT baseline_libsvm_sweep
-    else
-        r.pg  = solve_l1l2(ker, y, P, opts);
-        r.dcd = baseline_dcd_binary(ker, X, y, P, opts);
-        r.smo = baseline_libsvm_sweep(ker, X, y, P, opts);
     end
 end
 
